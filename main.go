@@ -6,12 +6,17 @@
 // call for real — then the conversation continues with the actual response in
 // hand.
 //
-// The brain is a local Ollama model. The hands are MCP tool-servers (today:
-// http-mcp, whose one tool is an HTTP request — which is also how you drive any
-// WebDriver/Appium hub). pilot is the host between them: it carries the
-// conversation, hands the model its tools, executes the calls, and loops.
+// The brain is a local Ollama model. The hands are two kinds of tools:
+//   - the wire (http-mcp, spawned as a tool-server): http_request + discover —
+//     also how you drive any WebDriver/Appium hub.
+//   - built-ins pilot provides itself: run_command (shell), read_file,
+//     write_file, list_dir. These live in the host, not the wire, so http-mcp
+//     stays a pure HTTP server.
+// pilot is the host between brain and hands: it carries the conversation, hands
+// the model the merged tool set, executes the calls, and loops. Mutating tools
+// (run_command, write_file) ask for confirmation in an interactive session.
 //
-// stdlib only. os/exec to run the tool-server, net/http to reach Ollama.
+// stdlib only. os/exec for the tool-server and shell, net/http to reach Ollama.
 //
 //	pilot                 # start talking
 //	echo "hi" | pilot     # one line over a pipe, then EOF
@@ -20,6 +25,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -49,6 +55,10 @@ func main() {
 	ollama := flag.String("ollama", "http://localhost:11434", "Ollama base URL")
 	server := flag.String("server", "", "path to the http-mcp tool-server binary (auto-detected if empty)")
 	maxSteps := flag.Int("max-steps", 12, "max tool-call rounds within a single turn")
+	showThinking := flag.Bool("show-thinking", false, "print the model's hidden reasoning (noisy)")
+	autoYes := flag.Bool("yes", false, "auto-approve mutating tools (run_command, write_file) without asking")
+	logPath := flag.String("log", filepath.Join(os.TempDir(), "pilot-toolserver.log"),
+		"file for the tool-server's logs, so they stay out of the chat")
 	flag.Parse()
 
 	bin, err := resolveServer(*server)
@@ -56,21 +66,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "pilot: %v\n", err)
 		os.Exit(1)
 	}
-	mcp, err := startServer(bin)
+	mcp, err := startServer(bin, *logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pilot: start tool-server: %v\n", err)
 		os.Exit(1)
 	}
 	defer mcp.close()
 
-	tools, err := mcp.handshake()
+	wireTools, err := mcp.handshake()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pilot: handshake: %v\n", err)
 		os.Exit(1)
 	}
+	tools := append(wireTools, builtinTools()...) // wire + host built-ins, merged for the model
 
 	repl(&session{
 		base: *ollama, model: *model, mcp: mcp, tools: tools, maxSteps: *maxSteps,
+		showThinking: *showThinking, autoYes: *autoYes, logPath: *logPath,
 		msgs: []message{{Role: "system", Content: system}},
 	}, toolNames(tools), bin)
 }
@@ -78,25 +90,31 @@ func main() {
 // ---- conversation ----
 
 type session struct {
-	base, model string
-	mcp         *mcpServer
-	tools       []map[string]any
-	maxSteps    int
-	msgs        []message // grows across turns; the dialogue is the state
+	base, model  string
+	mcp          *mcpServer
+	tools        []map[string]any
+	maxSteps     int
+	showThinking bool
+	autoYes      bool
+	logPath      string
+	interactive  bool
+	in           *bufio.Reader
+	msgs         []message // grows across turns; the dialogue is the state
 }
 
 func repl(s *session, names []string, bin string) {
-	interactive := isTTY(os.Stdin)
-	if interactive {
-		fmt.Fprintf(os.Stderr, "\033[2mpilot · model %s · tools %v · %s\033[0m\n", s.model, names, filepath.Base(bin))
-		fmt.Fprintf(os.Stderr, "\033[2mjust talk. /exit to leave.\033[0m\n")
+	s.interactive = isTTY(os.Stdin)
+	s.in = bufio.NewReader(os.Stdin)
+	if s.interactive {
+		fmt.Fprintf(os.Stderr, "\033[2mpilot · model %s · %d tools %v\033[0m\n", s.model, len(names), names)
+		fmt.Fprintf(os.Stderr, "\033[2mwire: %s · tool-server logs → %s\033[0m\n", filepath.Base(bin), s.logPath)
+		fmt.Fprintf(os.Stderr, "\033[2mjust talk. /exit to leave. (run_command + write_file ask before running)\033[0m\n")
 	}
-	in := bufio.NewReader(os.Stdin)
 	for {
-		if interactive {
+		if s.interactive {
 			fmt.Print("\033[1myou ❯\033[0m ")
 		}
-		line, err := in.ReadString('\n')
+		line, err := s.in.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line != "" {
 			switch line {
@@ -128,7 +146,7 @@ func (s *session) turn(userLine string) {
 		}
 		s.msgs = append(s.msgs, reply)
 
-		if reply.Thinking != "" {
+		if s.showThinking && reply.Thinking != "" {
 			fmt.Fprintf(os.Stderr, "\033[2m· %s\033[0m\n", oneLine(reply.Thinking))
 		}
 
@@ -152,7 +170,7 @@ func (s *session) turn(userLine string) {
 			if seen[sig] { // identical call already made — refuse and push it to answer
 				out = "Duplicate call suppressed — you already have this result above. Stop calling tools and answer the user now."
 				fmt.Fprintf(os.Stderr, "\033[33m  ⊘ duplicate suppressed\033[0m\n")
-			} else if out, err = s.mcp.callTool(tc.Function.Name, tc.Function.Arguments); err != nil {
+			} else if out, err = s.dispatch(tc.Function.Name, tc.Function.Arguments); err != nil {
 				out = "tool error: " + err.Error()
 			}
 			seen[sig] = true
@@ -210,9 +228,14 @@ type mcpServer struct {
 	id  int
 }
 
-func startServer(path string) (*mcpServer, error) {
+func startServer(path, logPath string) (*mcpServer, error) {
 	cmd := exec.Command(path)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = os.Stderr // fallback if the log file can't be opened
+	if logPath != "" {
+		if lf, e := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); e == nil {
+			cmd.Stderr = lf // keep the wire's chatter out of the chat
+		}
+	}
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -350,6 +373,134 @@ func (m *mcpServer) callTool(name string, args map[string]any) (string, error) {
 		return "", fmt.Errorf("%s", out)
 	}
 	return out, nil
+}
+
+// ---- built-in host tools (shell + filesystem) ----
+//
+// These live in pilot, not in the wire. The wire stays a pure HTTP server; the
+// host is where "act on this machine" belongs — same split Claude Code uses
+// (Bash + Read/Write are the harness's, not a remote service's).
+
+func builtinTools() []map[string]any {
+	str := func(d string) map[string]any { return map[string]any{"type": "string", "description": d} }
+	fn := func(name, desc string, props map[string]any, req ...any) map[string]any {
+		return map[string]any{"type": "function", "function": map[string]any{
+			"name": name, "description": desc,
+			"parameters": map[string]any{"type": "object", "properties": props, "required": req},
+		}}
+	}
+	return []map[string]any{
+		fn("run_command",
+			"Run a shell command on this Mac (sh -c) and return its combined stdout/stderr and exit code. Use it for adb, git, ls, idevice_id — anything you could type in a terminal. This controls real local devices and the machine itself.",
+			map[string]any{
+				"command":         str("The shell command line to run."),
+				"timeout_seconds": map[string]any{"type": "integer", "description": "Kill the command after this many seconds (default 60)."},
+			}, "command"),
+		fn("read_file", "Read a text file from this Mac and return its contents (first 100 KB).",
+			map[string]any{"path": str("Absolute or relative file path.")}, "path"),
+		fn("write_file", "Create or overwrite a text file on this Mac.",
+			map[string]any{"path": str("File path to write."), "content": str("Full text to write.")}, "path", "content"),
+		fn("list_dir", "List the entries of a directory on this Mac.",
+			map[string]any{"path": str("Directory path (defaults to the current directory).")}),
+	}
+}
+
+// dispatch routes a tool call: built-ins run here in Go; everything else goes to
+// the wire. Mutating built-ins ask the user first (unless -yes).
+func (s *session) dispatch(name string, args map[string]any) (string, error) {
+	switch name {
+	case "run_command", "write_file":
+		if !s.confirm(name) {
+			return "User declined to run this " + name + ". Do not retry it; ask the user how to proceed.", nil
+		}
+	}
+	if out, ok := s.callBuiltin(name, args); ok {
+		return out, nil
+	}
+	return s.mcp.callTool(name, args)
+}
+
+func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
+	switch name {
+	case "run_command":
+		cmdline := argStr(args, "command")
+		if cmdline == "" {
+			return "error: command is required", true
+		}
+		secs := 60
+		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+			secs = int(v)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(secs)*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, "sh", "-c", cmdline).CombinedOutput()
+		res := string(out)
+		if ctx.Err() == context.DeadlineExceeded {
+			res += fmt.Sprintf("\n[killed: exceeded %ds timeout]", secs)
+		}
+		return clip(res, 16000), true
+	case "read_file":
+		p := argStr(args, "path")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "error: " + err.Error(), true
+		}
+		return clip(string(b), 100_000), true
+	case "write_file":
+		p := argStr(args, "path")
+		if err := os.WriteFile(p, []byte(argStr(args, "content")), 0o644); err != nil {
+			return "error: " + err.Error(), true
+		}
+		return "wrote " + p, true
+	case "list_dir":
+		p := argStr(args, "path")
+		if p == "" {
+			p = "."
+		}
+		ents, err := os.ReadDir(p)
+		if err != nil {
+			return "error: " + err.Error(), true
+		}
+		var sb strings.Builder
+		for _, e := range ents {
+			kind := "f"
+			if e.IsDir() {
+				kind = "d"
+			}
+			fmt.Fprintf(&sb, "%s  %s\n", kind, e.Name())
+		}
+		return clip(sb.String(), 16000), true
+	}
+	return "", false // not a built-in — caller falls through to the wire
+}
+
+// confirm asks before a mutating action. Interactive: prompt y/N on the same
+// input stream. Non-interactive (piped): only proceed if -yes was given.
+func (s *session) confirm(action string) bool {
+	if s.autoYes {
+		return true
+	}
+	if !s.interactive {
+		return false
+	}
+	fmt.Printf("\033[33mallow %s? [y/N]\033[0m ", action)
+	line, _ := s.in.ReadString('\n')
+	a := strings.ToLower(strings.TrimSpace(line))
+	return a == "y" || a == "yes"
+}
+
+func argStr(m map[string]any, k string) string {
+	if s, ok := m[k].(string); ok {
+		return s
+	}
+	return ""
+}
+
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + fmt.Sprintf("\n…[truncated, %d bytes total]", len(s))
+	}
+	return s
 }
 
 // ---- helpers ----
