@@ -12,6 +12,7 @@
 //   - built-ins pilot provides itself: run_command (shell), read_file,
 //     write_file, list_dir. These live in the host, not the wire, so http-mcp
 //     stays a pure HTTP server.
+//
 // pilot is the host between brain and hands: it carries the conversation, hands
 // the model the merged tool set, executes the calls, and loops. Mutating tools
 // (run_command, write_file) ask for confirmation in an interactive session.
@@ -57,6 +58,7 @@ func main() {
 	maxSteps := flag.Int("max-steps", 12, "max tool-call rounds within a single turn")
 	showThinking := flag.Bool("show-thinking", false, "print the model's hidden reasoning (noisy)")
 	autoYes := flag.Bool("yes", false, "auto-approve mutating tools (run_command, write_file) without asking")
+	lean := flag.Bool("lean", false, "host-side curation: offer only the core tools each turn, unlocking probe/channel tools (discover, bidi_command) when the turn's intent asks for them — raises the floor for a weak model")
 	logPath := flag.String("log", filepath.Join(os.TempDir(), "pilot-toolserver.log"),
 		"file for the tool-server's logs, so they stay out of the chat")
 	flag.Parse()
@@ -82,7 +84,7 @@ func main() {
 
 	repl(&session{
 		base: *ollama, model: *model, mcp: mcp, tools: tools, maxSteps: *maxSteps,
-		showThinking: *showThinking, autoYes: *autoYes, logPath: *logPath,
+		showThinking: *showThinking, autoYes: *autoYes, lean: *lean, logPath: *logPath,
 		msgs: []message{{Role: "system", Content: system}},
 	}, toolNames(tools), bin)
 }
@@ -93,9 +95,11 @@ type session struct {
 	base, model  string
 	mcp          *mcpServer
 	tools        []map[string]any
+	turnTools    []map[string]any // tools offered this turn (scoped when lean)
 	maxSteps     int
 	showThinking bool
 	autoYes      bool
+	lean         bool // host-side curation: gate probe/channel tools behind intent
 	logPath      string
 	interactive  bool
 	in           *bufio.Reader
@@ -134,6 +138,14 @@ func repl(s *session, names []string, bin string) {
 // and center.
 func (s *session) turn(userLine string) {
 	s.msgs = append(s.msgs, message{Role: "user", Content: userLine})
+
+	// Host-side curation: a weak model handed the whole surface freelances (it
+	// copies a schema example and calls the wrong tool). When lean, offer the
+	// core every turn and unlock probe/channel tools only when intent asks.
+	s.turnTools = s.tools
+	if s.lean {
+		s.turnTools = scopeTools(userLine, s.tools)
+	}
 
 	seen := map[string]bool{} // (name+args) already run this turn — a weak model loops; we don't let it
 	nudgedEmpty := false
@@ -197,8 +209,12 @@ type toolCall struct {
 }
 
 func (s *session) chat() (message, error) {
+	tools := s.tools
+	if s.turnTools != nil {
+		tools = s.turnTools
+	}
 	body, _ := json.Marshal(map[string]any{
-		"model": s.model, "messages": s.msgs, "tools": s.tools, "stream": false,
+		"model": s.model, "messages": s.msgs, "tools": tools, "stream": false,
 		"options": map[string]any{"temperature": 0},
 	})
 	resp, err := http.Post(s.base+"/api/chat", "application/json", bytes.NewReader(body))
@@ -403,6 +419,34 @@ func builtinTools() []map[string]any {
 		fn("list_dir", "List the entries of a directory on this Mac.",
 			map[string]any{"path": str("Directory path (defaults to the current directory).")}),
 	}
+}
+
+// scopeTools is curation relocated to the host. The wire stays lean and offers
+// every atom; the host decides which to put in front of the model this turn. A
+// weak model handed the full surface freelances — it copies the example in a
+// tool's schema and calls the wrong one (we watched a 12B do exactly that with
+// discover). So we gate the rarely-needed, easily-misused probe/channel atoms
+// behind explicit intent, and always offer the safe core. Off by default
+// (-lean): strong models want the whole surface; weak ones want the floor raised.
+func scopeTools(userLine string, all []map[string]any) []map[string]any {
+	gated := map[string]bool{"discover": true, "bidi_command": true}
+	intent := strings.ToLower(userLine)
+	for _, kw := range []string{
+		"discover", "probe", "capabilit", "endpoint", "which command", "what command",
+		"bidi", "cdp", "devtools", "subscribe", "channel", "session caps", "websocket",
+	} {
+		if strings.Contains(intent, kw) {
+			return all // intent asks for the deep surface — unlock everything
+		}
+	}
+	out := make([]map[string]any, 0, len(all))
+	for _, t := range all {
+		name, _ := t["function"].(map[string]any)["name"].(string)
+		if !gated[name] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // dispatch routes a tool call: built-ins run here in Go; everything else goes to
