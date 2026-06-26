@@ -1,113 +1,131 @@
-# pilot
+# pilot — the HOST
 
-A local model with hands.
+> Part of **The Wire** — a four-arm system for protocol-agnostic test automation with record & replay.
+> **This repo is the pilot — the HOST** — the local-model OODA Orient+Decide loop; imports an adapter to run flows.
 
-Talk to it like you'd talk to anyone. There is no objective up front — you can
-open with `hi`. The work grows out of the dialogue. When what you ask needs a
-real call against the world, the model reaches for a tool and pilot makes the
-call for real; the conversation then continues with the actual response in hand.
+---
 
-```
-brain   a local Ollama model
-hands   the wire   — http-mcp tool-server: http_request + bidi_command + discover
-                     (the call and the channel — WebDriver/Appium over HTTP,
-                      CDP/BiDi over a WebSocket)
-        built-ins  — run_command (shell), read_file, write_file, list_dir
-pilot   the host between them: carries the conversation, hands the model the
-        merged tool set, executes the calls, loops
-```
+<!-- ===== SHARED TERRITORY (identical across http-mcp · 8 · pilot · adapters) ===== -->
 
-No SDK, no framework. stdlib only: `os/exec` runs the tool-server and shell,
-`net/http` reaches Ollama.
+# The Wire — a four-arm system
 
-## Tools
+**Every test/automation interaction reduces to two _modes_ over a deliberately lean wire.**
+Capability is composed _above_ the wire by three more arms. A fork of these four arms
+turns any existing regression suite into a record-and-replay automation suite.
 
-| tool | source | what it does |
+> The thesis: a wire that holds exactly **two modes** + a generic credential-injection
+> mechanism + generic probe/harvest is *enough* to reach every provider, every framework,
+> every protocol — without the wire knowing about any of them. Proven live: a 15-combo
+> matrix (selenium · appium rd+vd app+web · puppeteer · playwright · espresso · xcui) ran
+> through just those two tools.
+
+## The four arms
+
+| Arm | Repo | Gives you | Owns | Never owns |
+|---|---|---|---|---|
+| **WIRE** | `http-mcp` | reach | the two modes (`http_request`, `bidi_command`), auth-injection mechanism, probe/harvest, route-priors | provider logic, composition, observation |
+| **HOST** | `pilot` | agency | local-model OODA Orient+Decide, shell/fs, imports an adapter | the wire's transport, provider shape |
+| **WITNESS** | `8` | sight | OODA Observe across all tabs, aperture-control, names the cause, recommends | control of any target — it observes, never drives |
+| **ADAPTERS** | `adapters` | shape | per-provider spec/runner/upload/catalog/composer, record→replay, provider-shaped auth | the generic arms (it depends on them, one-way) |
+
+The dependency arrow is one-way: adapters → host/witness → wire. Lower layers never know the upper ones.
+
+## Two MODES, two atoms
+
+A **mode** is an interaction shape — *not* a transport. There are exactly two:
+
+- **CALL** — one request → one response (discrete). Tool: **`http_request`**.
+- **CHANNEL** — a held duplex connection you produce commands into and consume events from (continuous). Tool: **`bidi_command`**.
+
+Two modes, two atoms. Everything else is a *dialect* (of a mode) or a *direction* (of CHANNEL).
+
+## Transport map — every transport ⇒ 2 modes ⇒ which arm owns it
+
+![Transport map — modes](docs/diagrams/03-transport-map-modes.png)
+
+| Transport | Mode | Owner | Where |
+|---|---|---|---|
+| HTTP | CALL | wire | `http_request` (probe: webdriver/appium/REST) |
+| gRPC-unary | CALL | wire shape · adapter serializes protobuf | `grpc://` + pb payload |
+| WebSocket / CDP / BiDi | CHANNEL | wire | `bidi_command` (probe: cdp/bidi) |
+| gRPC-stream | CHANNEL | adapter framing | stream over h2 |
+| MQTT pub/sub | CHANNEL | adapter topic-map | broker + topic |
+| WebRTC | CHANNEL (data) / OBSERVE (video) | adapter SDP | — |
+| Unix domain socket | CALL/CHANNEL (locality) | adapters · BYOD | `unix://` + `SCM_RIGHTS` fd-passing |
+| SSE | OBSERVE (afferent-only) | **8** (witness) | held read-only `/feed` |
+
+Three orthogonal properties were conflated by the naive "list of physics": **shape** (the only true mode: CALL/CHANNEL), **transport/locality** (a dialect — lives in adapters), and **direction** (full-duplex vs afferent-only OBSERVE — a sub-mode of CHANNEL, the witness's diet). The wire owns shape only; adapters own every dialect's encoding.
+
+## The afferent law (the core IP)
+
+The model learns **only from what comes back** (afferent); nothing flows *toward* it but observation.
+**Act lives inside Observe** — an act is known only by observing its result. `efferent` (toward the target)
+is one leg; the model's knowledge is built from the `afferent` leg alone.
+
+## 8 — the witness: observe every tab, control none
+
+8 is the OODA **Observe**. It must see *all* tabs (per-tab memory/CPU/events, including itself)
+without driving any of them. Two strictly separate channels:
+
+| Channel | What | Control? |
 |---|---|---|
-| `http_request` | wire (http-mcp) | one HTTP call — any API, or a WebDriver/Appium hub |
-| `bidi_command` | wire (http-mcp) | one CDP/WebDriver-BiDi command over a WebSocket — the wire beneath Playwright/Puppeteer |
-| `discover` | wire (http-mcp) | probe what a hub actually serves |
-| `run_command` | host (built-in) | run a shell command (`adb`, `git`, …) — controls the machine & real devices |
-| `read_file` / `write_file` / `list_dir` | host (built-in) | the local filesystem |
+| **Observation** (8) | `browsingContext.getTree`, `about:processes` sampling, `session.subscribe` | **read-only — no commands** |
+| **Control** (pilot/adapters/operator) | `bidi_command`, `http_request` | efferent — sent via the wire |
 
-Shell + filesystem live in the **host**, not the wire — same split Claude Code
-uses (its Bash/Read/Write belong to the harness, not a remote service). http-mcp
-stays a pure HTTP server.
+- **Gated trace:** continuous *ambient telemetry* (mem/CPU/event-rate, ~10s) on **all** tabs; **full** high-rate trace only on the context-under-test.
+- **Aperture-control** (8 throttles itself, never the target): sampling rate · event filtering · coalescing · circuit-breaker (unsubscribe a noisy context) · byte-budgeted eviction. 8 applies the same controls to its *own* consumption so the witness never starves what it watches.
+- **The boundary:** 8 can recommend recycling a leaking tab → pilot decides → wire executes. 8 itself **never** navigates or commands a target. It recommends; it does not act.
 
-**Safety:** `run_command` and `write_file` ask `allow …? [y/N]` before running in
-an interactive session. Pass `-yes` to auto-approve (e.g. for piped input). The
-`→` line always prints the exact call first, so nothing runs unseen.
+![Data plane — what each arm stores](docs/diagrams/04-data-plane.png)
 
-## Roles, kept separate
+## Record & replay — a fork becomes a suite
 
-pilot is a **host** (model-aware: it drives the model and executes tools).
-[http-mcp](https://github.com/rrrishi123/http-mcp) is a **server** (the wire —
-model-agnostic, pure protocol calls). MCP draws that line on purpose; this repo
-keeps it. The wire never grows model code; pilot grows toward more tools and
-more models without polluting the wire.
+The spine of the suite:
 
 ```
-   you ──▶  pilot (host)  ◀──▶  a local model (the brain)
-                 │  composes atoms into what the turn needs
-                 ▼
-            the wire  (http-mcp — model-agnostic)
-                 http_request   a call      ·  Selenium / Appium / any API
-                 bidi_command   a channel   ·  Playwright / Puppeteer / CDP·BiDi
-                 │
-                 ▼
-            the world  (browsers, devices, APIs)
+RECORD  →  SPEC  →  REPLAY  →  SUITE
+  8         neutral   adapters    curated matrix
+ traces     trace     runner      on a fork
 ```
 
-The wire offers the **atoms**; the host composes them (and curates which to
-offer a weaker model — see `-lean`). Nothing the model can't already do is
-added here — the hands just let what it knows reach the world.
+- **Neutral trace** (the 8 ↔ replay contract): streamable NDJSON `Frame`s — `seq · ts · session · mode · dir` + payload. **A frame carries `auth_slot` (where a credential injects), never the secret** — the trace is safe to store and share; the secret stays below the boundary.
+- **Suite structure** (above the wire): test files, runners, **CI invocation, env vars, pre/post hooks** (e.g. app-upload). The trace captures *what the wire did*; the suite structure captures *why/how it was invoked*. Lives in the tenant fork.
+- Flow: **Observe** (8 traces a real run) → **Annotate** (map trace ↔ suite context) → **Materialize** (runner → provider-specific replayable spec) → **Replay**.
 
-## Run
+## Architecture views
 
-```
-go build -o pilot .
-./pilot
-```
+![C4 container](docs/diagrams/01-c4-container.png)
 
-It auto-detects the http-mcp binary: `$HTTP_MCP_BIN`, then `PATH`, then the
-sibling-repo convention (`repos/pilot` next to `repos/http-mcp`). Override with
-`-server /path/to/http-mcp`.
+![C4 component](docs/diagrams/02-c4-component.png)
 
-```
-you ❯ hi
-pilot ❯ Hey — what are we doing?
-you ❯ what does github's zen endpoint say right now
-  → http_request {"method":"GET","url":"https://api.github.com/zen"}
-  ← {"status":200, ...}
-pilot ❯ It says: "Non-blocking is better than blocking."
-```
+## Deployment model — product vs client (two identities)
 
-`/exit` to leave. Pipe a single line with `echo "hi" | ./pilot`.
+- **Product / IP** = the four generic arms. They stay provider- and tenant-agnostic.
+- **Client / tenant** = a **fork** of all four arms. Everything tenant-specific (regression specs, app inventory, CI runners) lives **only in the fork's `adapters`**, never upstream.
+- A real tenant maps its existing regression suites → records them via 8 → replays them via the adapters runner.
+- One-way dependency: the fork depends on upstream arms; upstream never learns the tenant. Generic fixes are PR'd back upstream; tenant specifics stay in the fork.
 
-**Keep the chat clean:** run the Ollama engine as a background service
-(`brew services start ollama`) rather than `ollama serve &` in your terminal —
-otherwise the engine's `slot`/`GIN` logs print into the same pane as your chat.
-pilot already routes the tool-server's own logs to a file (see `-log`).
+## Versioning
 
-## Flags
+Independent semver **per arm** + a separately-versioned **contract** (trace format, RunRequest/RunResult).
+Each arm declares which contract version it supports; the replay runner checks a trace's contract version
+before replaying. Baseline: **`v0.0.1`** across all four arms.
 
-| flag | default | |
-|---|---|---|
-| `-model` | the local Gemma-4 coder GGUF | Ollama model tag |
-| `-ollama` | `http://localhost:11434` | Ollama base URL |
-| `-server` | auto-detect | http-mcp binary path |
-| `-max-steps` | `12` | max tool rounds within one turn |
-| `-show-thinking` | `false` | print the model's hidden reasoning (noisy) |
-| `-yes` | `false` | auto-approve `run_command` / `write_file` |
-| `-lean` | `false` | host-side curation: offer only the core tools each turn, unlocking the probe/channel atoms (`discover`, `bidi_command`) when the turn's intent asks — raises the floor for a weak model |
-| `-log` | temp file | where the tool-server's logs go |
+## Why "the wire is enough"
 
-## Note on the model
+Grounded, not vibes: **End-to-End Argument** (Saltzer/Reed/Clark 1984) — interaction shape, not transport,
+is the architectural invariant; **Hourglass / narrow-waist** (Beck, CACM 2019) — the waist's power is minimality;
+**Dependency Inversion** (Martin) — the arrow points at the wire, never away; **Protocol ossification** (RFC 9170) —
+bake in a transport and you ossify to it, so the waist is defined by mode not transport; **OODA** (Boyd) — host
+Orients/Decides, witness Observes; **Kalman observability** — you cannot control what you cannot observe;
+**Bulkhead / backpressure / circuit-breaker** (Nygard) — aperture-control of the observer itself.
 
-A 12B local coder model calls single tools well but is weaker at long multi-step
-chains than a frontier model — it sometimes narrates instead of acting, or
-freelances a tool by copying an example out of its schema. pilot pins
-`temperature: 0` and a system prompt that forbids simulated calls to keep it on
-the wire. `-lean` goes further: it curates the tool surface per turn so the
-model isn't handed atoms it doesn't need — curation lives in the host, never in
-the wire. Bigger quants behave better but need more memory.
+## The four repos
+
+- WIRE — https://github.com/rrrishi123/http-mcp
+- WITNESS — https://github.com/rrrishi123/8
+- HOST — https://github.com/rrrishi123/pilot
+- ADAPTERS — https://github.com/rrrishi123/adapters
+
+> These PRs are the **territory map**. They are intentionally not merged — they accumulate until the
+> four-arm picture is complete, then become the clean first commit of each repo.
