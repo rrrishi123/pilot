@@ -39,7 +39,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/peterh/liner"
 )
 
 const defaultModel = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q4_K_M"
@@ -253,27 +252,15 @@ type session struct {
 	interactive  bool
 	in           *bufio.Reader
 	noReadline   bool              // disable readline even when interactive
-	rl           *liner.State      // readline state (nil when piped or -no-readline)
+	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
 	msgs         []message         // grows across turns; the dialogue is the state
 }
 
 func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
 	if s.interactive && !s.noReadline {
-		s.rl = liner.NewLiner()
-		defer s.rl.Close()
-		s.rl.SetCtrlCAborts(true)
-		// Core keybindings: all standard readline keys work by default
-		//   Ctrl+A=Home  Ctrl+E=End  Ctrl+U=delete-to-start (like cmd+del)
-		//   Ctrl+K=delete-to-end  Ctrl+W=delete-word-backward
-		//   Home/End/Left/Right arrow keys
-		// History persists across sessions
-		if home, err := os.UserHomeDir(); err == nil {
-			if f, e := os.Open(filepath.Join(home, ".pilot_history")); e == nil {
-				s.rl.ReadHistory(f)
-				f.Close()
-			}
-		}
+		home, _ := os.UserHomeDir()
+		s.lr = newLineReader(filepath.Join(home, ".pilot_history"))
 	} else {
 		s.in = bufio.NewReader(os.Stdin)
 	}
@@ -281,15 +268,15 @@ func repl(s *session, names []string, bin string) {
 		fmt.Fprintf(os.Stderr, "\033[2mpilot · model %s · %d tools %v\033[0m\n", s.model, len(names), names)
 		fmt.Fprintf(os.Stderr, "\033[2mwire: %s · tool-server logs → %s\033[0m\n", filepath.Base(bin), s.logPath)
 		fmt.Fprintf(os.Stderr, "\033[2mjust talk. /exit to leave. (run_command + write_file ask before running)\033[0m\n")
-		if s.rl != nil {
-			fmt.Fprintf(os.Stderr, "\033[2mreadline on: Home/End, Ctrl+A/E/U/K/W — history saved to ~/.pilot_history\033[0m\n")
+		if s.lr != nil {
+			fmt.Fprintf(os.Stderr, "\033[2mreadline: ↑ history, Home/End, Ctrl+A/E/U/K/W — paste multi-line safely (Enter fires only on your keypress)\033[0m\n")
 		}
 	}
 	for {
 		var line string
 		var err error
-		if s.rl != nil {
-			line, err = s.rl.Prompt("you ❯ ") // liner rejects ANSI escapes in the prompt
+		if s.lr != nil {
+			line, err = s.lr.readLine("you ❯ ", true)
 		} else {
 			if s.interactive {
 				fmt.Print("\033[1myou ❯\033[0m ")
@@ -297,7 +284,7 @@ func repl(s *session, names []string, bin string) {
 			line, err = s.in.ReadString('\n')
 		}
 		if err != nil {
-			if err == liner.ErrPromptAborted { // Ctrl-C aborts the line, not the session
+			if err == errAborted { // Ctrl-C aborts the line, not the session
 				continue
 			}
 			if err != io.EOF {
@@ -312,18 +299,10 @@ func repl(s *session, names []string, bin string) {
 				s.redeploy() // rebuild + re-exec in place; returns only on failure
 				continue
 			case "/exit", "/quit", "/bye":
-				if s.rl != nil {
-					if home, e := os.UserHomeDir(); e == nil {
-						if f, e2 := os.Create(filepath.Join(home, ".pilot_history")); e2 == nil {
-							s.rl.WriteHistory(f)
-							f.Close()
-						}
-					}
+				if s.lr != nil {
+					s.lr.saveHistory()
 				}
 				return
-			}
-			if s.rl != nil {
-				s.rl.AppendHistory(line)
 			}
 			s.turn(line)
 		}
@@ -822,8 +801,8 @@ func (s *session) redeploy() {
 	if s.mcp != nil && s.mcp.cmd != nil && s.mcp.cmd.Process != nil {
 		_ = s.mcp.cmd.Process.Kill() // the new build spawns its own tool-server
 	}
-	if s.rl != nil {
-		s.rl.Close() // restore the terminal so the new liner starts clean
+	if s.lr != nil {
+		s.lr.saveHistory() // persist before re-exec (the terminal is already restored per readLine)
 	}
 	fmt.Fprintln(os.Stderr, "\033[2mredeploy: re-exec into the new binary (same terminal, session preserved) …\033[0m")
 	if err := syscall.Exec(bin, argv, os.Environ()); err != nil {
@@ -1321,8 +1300,8 @@ func (s *session) confirm(action string) bool {
 	}
 	prompt := fmt.Sprintf("\033[33mallow %s? [y/N]\033[0m ", action)
 	var a string
-	if s.rl != nil {
-		line, err := s.rl.Prompt(prompt)
+	if s.lr != nil {
+		line, err := s.lr.readLine(prompt, false)
 		if err != nil {
 			return false
 		}
