@@ -61,7 +61,8 @@ const deepseekCapabilities = "You run on the DeepSeek API (OpenAI-compatible). K
 	"You can reason before answering (reasoning effort high/medium/low) — reasoning costs output tokens, so spend it on hard multi-step problems, not trivial replies. " +
 	"You call tools with JSON args and read the real result back; JSON output mode and automatic prompt-prefix caching (cheaper cache hits) are available. " +
 	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — ONE shared socket, so http_request POST commands like browsingContext.getTree / browsingContext.create (make your own tab) / browsingContext.navigate / script.evaluate (run JS in a tab's context id), and never open a 2nd websocket; and use this machine's shell and filesystem. " +
-	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read."
+	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read. " +
+	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR (default ~/Desktop/repos/pilot) — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
 
 // loadEnvFile pulls KEY=VALUE lines from $PILOT_ENV (or ~/.pilot.env) into the process
 // env — so plain `./pilot` works without hand-sourcing DEEPSEEK_API_KEY/KOSATEN_API_KEY.
@@ -297,6 +298,14 @@ func repl(s *session, names []string, bin string) {
 			switch line {
 			case "/redeploy":
 				s.redeploy() // rebuild + re-exec in place; returns only on failure
+				continue
+			case "/yes", "/trust": // stop asking permission for run_command/write_file this session
+				s.autoYes = true
+				fmt.Fprintln(os.Stderr, "\033[2mtrust ON — run_command/write_file run without asking (/ask to re-enable prompts)\033[0m")
+				continue
+			case "/ask": // re-enable the confirmation prompts
+				s.autoYes = false
+				fmt.Fprintln(os.Stderr, "\033[2mtrust OFF — mutating tools will ask again\033[0m")
 				continue
 			case "/exit", "/quit", "/bye":
 				if s.lr != nil {
