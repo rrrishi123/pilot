@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -106,7 +107,7 @@ func main() {
 	server := flag.String("server", "", "path to the http-mcp tool-server binary (auto-detected if empty)")
 	maxSteps := flag.Int("max-steps", 0, "max tool-call rounds within a single turn (0 = no limit — pilot moves until it is done)")
 	showThinking := flag.Bool("show-thinking", false, "print the model's hidden reasoning (full — no truncation)")
-	autoYes := flag.Bool("yes", false, "auto-approve mutating tools (run_command, write_file) without asking")
+	autoYes := flag.Bool("yes", true, "auto-approve mutating tools (run_command, write_file) without asking")
 	lean := flag.Bool("lean", false, "host-side curation: offer only the core tools each turn, unlocking probe/channel tools (discover, bidi_command) when the turn's intent asks for them — raises the floor for a weak model")
 	logPath := flag.String("log", filepath.Join(os.TempDir(), "pilot-toolserver.log"),
 		"file for the tool-server's logs, so they stay out of the chat")
@@ -253,12 +254,30 @@ type session struct {
 	interactive  bool
 	in           *bufio.Reader
 	noReadline   bool              // disable readline even when interactive
+	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
+	interruptLine string // the line to preload when returning to the prompt
+	savedLine    string                     // the line being processed (for interrupt recovery)
+	cancel       context.CancelFunc         // cancel the in-flight API request on Ctrl+C
 	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
 	msgs         []message         // grows across turns; the dialogue is the state
 }
 
 func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
+	// Catch Ctrl+C during model thinking: cancel the API call,
+	// keep the user's input, and return to the prompt for editing.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	go func() {
+		for range sigCh {
+			if s.cancel != nil {
+				s.interrupted = true
+				s.interruptLine = s.savedLine
+				s.cancel()
+			}
+		}
+	}()
+
 	if s.interactive && !s.noReadline {
 		home, _ := os.UserHomeDir()
 		s.lr = newLineReader(filepath.Join(home, ".pilot_history"))
@@ -270,7 +289,7 @@ func repl(s *session, names []string, bin string) {
 		fmt.Fprintf(os.Stderr, "\033[2mwire: %s · tool-server logs → %s\033[0m\n", filepath.Base(bin), s.logPath)
 		fmt.Fprintf(os.Stderr, "\033[2mjust talk. /exit to leave. (run_command + write_file ask before running)\033[0m\n")
 		if s.lr != nil {
-			fmt.Fprintf(os.Stderr, "\033[2mreadline: ↑ history, Home/End, Ctrl+A/E/U/K/W — paste multi-line safely (Enter fires only on your keypress)\033[0m\n")
+			fmt.Fprintf(os.Stderr, "\033[2mreadline: ↑↓ history, Home/End, Ctrl+A/E/U/K/W — Ctrl+J / Shift+Enter inserts newline · \\ + Enter continues line — Ctrl+C to abort/correct\033[0m\n")
 		}
 	}
 	for {
@@ -313,7 +332,15 @@ func repl(s *session, names []string, bin string) {
 				}
 				return
 			}
+			s.savedLine = line
 			s.turn(line)
+			if s.interrupted {
+				s.lr.preload = s.interruptLine
+				s.interrupted = false
+				s.interruptLine = ""
+				fmt.Fprintf(os.Stderr, "\033[2m⏎ interrupted — edit your input and press Enter\033[0m\n")
+				continue
+			}
 		}
 	}
 }
@@ -349,7 +376,9 @@ func (s *session) turn(userLine string) {
 	for step := 0; s.maxSteps <= 0 || step < s.maxSteps; step++ { // 0 = no limit
 		reply, err := s.chat()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "\033[31mpilot: %v\033[0m\n", err)
+			if !s.interrupted {
+				fmt.Fprintf(os.Stderr, "\033[31mpilot: %v\033[0m\n", err)
+			}
 			return
 		}
 		s.msgs = append(s.msgs, reply)
@@ -485,7 +514,10 @@ func (s *session) chatDeepSeek(tools []map[string]any) (message, error) {
 		reqBody["reasoning_effort"] = s.turnEffort
 	}
 	body, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST", s.base+"/chat/completions", bytes.NewReader(body))
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	defer func() { s.cancel = nil; cancel() }()
+	req, _ := http.NewRequestWithContext(ctx, "POST", s.base+"/chat/completions", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	resp, err := http.DefaultClient.Do(req)
