@@ -182,16 +182,20 @@ func main() {
 	// each server that isn't reachable is skipped (office has local ltqa + hosted kosaten;
 	// omarchy has local kosaten; a stranger has their own — no code change for any of it).
 	// -kosaten is kept as a built-in fallback spec when no config file exists.
-	bridges := map[string]*httpMCP{} // "<name>_" prefix -> bridged server, for call routing
+	bridges := map[string]bridge{} // "<name>_" prefix -> bridged server (HTTP or stdio)
 	for _, sp := range loadMCPSpecs(*kosatenURL) {
-		h, mtools, err := startMCP(sp)
+		h, mtools, err := startMCP(sp, *logPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[2mpilot: mcp %q off (%v)\033[0m\n", sp.Name, err)
 			continue
 		}
 		bridges[sp.Name+"_"] = h
 		tools = append(tools, mtools...)
-		fmt.Fprintf(os.Stderr, "\033[2mmcp: bridged %d tools from %s (%s)\033[0m\n", len(mtools), sp.Name, sp.URL)
+		where := sp.URL
+		if where == "" {
+			where = sp.Command
+		}
+		fmt.Fprintf(os.Stderr, "\033[2mmcp: bridged %d tools from %s (%s)\033[0m\n", len(mtools), sp.Name, where)
 	}
 
 	sysPrompt := system
@@ -237,7 +241,7 @@ type session struct {
 	turnThinking bool   // whether to enable reasoning this turn
 	turnEffort   string // reasoning_effort when thinking
 	mcp          *mcpServer
-	bridges      map[string]*httpMCP // "<name>_" prefix -> bridged MCP server (config-driven)
+	bridges      map[string]bridge   // "<name>_" prefix -> bridged MCP (HTTP or stdio), config-driven
 	castleFile   string   // if set, dump the session here each turn for the block-world UI
 	tools        []map[string]any
 	turnTools    []map[string]any // tools offered this turn (scoped when lean)
@@ -892,14 +896,25 @@ var kosatenTools = map[string]bool{
 	"get_pulse": true, "digest": true,
 }
 
-// mcpSpec declares one MCP server to bridge — in CONFIG, not code. url is the HTTP MCP
-// endpoint; key_env names the env var holding a bearer token (optional); tools is an
-// optional allowlist ([] = expose all). name becomes the "<name>_" tool prefix.
+// mcpSpec declares one MCP server to bridge — in CONFIG, not code. Two transports:
+// HTTP (set url; key_env names a bearer-token env var) or stdio (set command/args/cwd/
+// env, like a `uv run …` server). tools is an optional allowlist ([] = expose all).
+// name becomes the "<name>_" tool prefix.
 type mcpSpec struct {
-	Name   string   `json:"name"`
-	URL    string   `json:"url"`
-	KeyEnv string   `json:"key_env"`
-	Tools  []string `json:"tools"`
+	Name    string            `json:"name"`
+	URL     string            `json:"url"`     // HTTP transport
+	KeyEnv  string            `json:"key_env"` // env var with the bearer token (HTTP)
+	Command string            `json:"command"` // stdio transport
+	Args    []string          `json:"args"`
+	Cwd     string            `json:"cwd"`
+	Env     map[string]string `json:"env"`
+	Tools   []string          `json:"tools"`
+}
+
+// bridge is either transport — anything that can run a tool by name. httpMCP (HTTP) and
+// mcpServer (stdio) both satisfy it, so call-routing doesn't care which a server uses.
+type bridge interface {
+	callTool(name string, args map[string]any) (string, error)
 }
 
 // loadMCPSpecs reads the bridge list from $PILOT_MCP (or ~/.pilot/mcp.json). This is how
@@ -995,46 +1010,125 @@ func (h *httpMCP) notify(method string) {
 	}
 }
 
-// startMCP connects to one MCP server and returns its tools (optionally allow-listed),
-// each prefixed with sp.Name+"_". Generic — the same path bridges kosaten, ltqa-local,
-// or any client's own MCP; adding one is config (see loadMCPSpecs), not code.
-func startMCP(sp mcpSpec) (*httpMCP, []map[string]any, error) {
-	h := &httpMCP{url: sp.URL, key: os.Getenv(sp.KeyEnv)}
+// mcpTool is a tool as the server advertises it (before pilot's "<name>_" prefix).
+type mcpTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	InputSchema any    `json:"inputSchema"`
+}
+
+// listTools runs initialize + tools/list on an HTTP MCP and returns the raw tools.
+func (h *httpMCP) listTools() ([]mcpTool, error) {
 	_, sid, err := h.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
 		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	h.sid = sid
 	h.notify("notifications/initialized")
 	res, _, err := h.rpc("tools/list", nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var tl struct {
-		Tools []struct {
-			Name        string          `json:"name"`
-			Description string          `json:"description"`
-			InputSchema json.RawMessage `json:"inputSchema"`
-		} `json:"tools"`
+		Tools []mcpTool `json:"tools"`
 	}
 	if err := json.Unmarshal(res, &tl); err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	return tl.Tools, nil
+}
+
+// startStdio spawns a stdio MCP server (command/args/cwd/env from the spec) — the same
+// mcpServer used for the http-mcp tool-server, reused for any config-declared stdio MCP
+// (e.g. `uv run --directory … python -m mcp_server.server`).
+func startStdio(sp mcpSpec, logPath string) (*mcpServer, error) {
+	cmd := exec.Command(sp.Command, sp.Args...)
+	cmd.Dir = sp.Cwd
+	cmd.Env = os.Environ()
+	for k, v := range sp.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	cmd.Stderr = os.Stderr
+	if logPath != "" {
+		if lf, e := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); e == nil {
+			cmd.Stderr = lf
+		}
+	}
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &mcpServer{cmd: cmd, in: in, out: bufio.NewReader(out)}, nil
+}
+
+// listTools runs initialize + tools/list on a stdio MCP and returns the raw tools.
+func (m *mcpServer) listTools() ([]mcpTool, error) {
+	if _, err := m.rpc("initialize", map[string]any{
+		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
+		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
+	}); err != nil {
+		return nil, err
+	}
+	m.notify("notifications/initialized")
+	res, err := m.rpc("tools/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	var tl struct {
+		Tools []mcpTool `json:"tools"`
+	}
+	if err := json.Unmarshal(res, &tl); err != nil {
+		return nil, err
+	}
+	return tl.Tools, nil
+}
+
+// startMCP bridges one MCP server (HTTP or stdio, chosen by which spec fields are set)
+// and returns a client + its tools, each prefixed with sp.Name+"_" and optionally
+// allow-listed. Adding a server is config (loadMCPSpecs), not code.
+func startMCP(sp mcpSpec, logPath string) (bridge, []map[string]any, error) {
+	var raw []mcpTool
+	var b bridge
+	if sp.Command != "" {
+		m, err := startStdio(sp, logPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if raw, err = m.listTools(); err != nil {
+			m.close()
+			return nil, nil, err
+		}
+		b = m
+	} else {
+		h := &httpMCP{url: sp.URL, key: os.Getenv(sp.KeyEnv)}
+		var err error
+		if raw, err = h.listTools(); err != nil {
+			return nil, nil, err
+		}
+		b = h
 	}
 	allow := map[string]bool{}
 	for _, t := range sp.Tools {
 		allow[t] = true
 	}
 	var tools []map[string]any
-	for _, t := range tl.Tools {
+	for _, t := range raw {
 		if len(allow) > 0 && !allow[t.Name] {
 			continue // allowlist ([] = expose all)
 		}
-		var schema any = map[string]any{"type": "object", "properties": map[string]any{}}
-		if len(t.InputSchema) > 0 {
-			_ = json.Unmarshal(t.InputSchema, &schema)
+		schema := t.InputSchema
+		if schema == nil {
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 		tools = append(tools, map[string]any{
 			"type": "function",
@@ -1045,7 +1139,7 @@ func startMCP(sp mcpSpec) (*httpMCP, []map[string]any, error) {
 			},
 		})
 	}
-	return h, tools, nil
+	return b, tools, nil
 }
 
 func (h *httpMCP) callTool(name string, args map[string]any) (string, error) {

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "kosaten",
+    "url": "https://mcp.kosaten.ai/mcp",
+    "key_env": "KOSATEN_API_KEY",
+    "tools": ["know_me", "recall_decision", "get_health", "digest"]
+  },
+  {
+    "name": "ltqa",
+    "command": "uv",
+    "args": ["run", "--directory", "/path/to/ltqa-platform", "python", "-m", "mcp_server.server"],
+    "cwd": "/path/to/ltqa-platform",
+    "env": { "LTQA_MCP_EMIT_EVENTS": "true" },
+    "tools": ["list_devices", "build_capabilities", "create_test_matrix"]
+  }
+]
