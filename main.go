@@ -64,6 +64,41 @@ const deepseekCapabilities = "You run on the DeepSeek API (OpenAI-compatible). K
 	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — ONE shared socket, so http_request POST commands like browsingContext.getTree / browsingContext.create (make your own tab) / browsingContext.navigate / script.evaluate (run JS in a tab's context id), and never open a 2nd websocket; and use this machine's shell and filesystem. " +
 	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read."
 
+// loadEnvFile pulls KEY=VALUE lines from $PILOT_ENV (or ~/.pilot.env) into the process
+// env — so plain `./pilot` works without hand-sourcing DEEPSEEK_API_KEY/KOSATEN_API_KEY.
+// Real env wins (only sets unset keys). Tolerates `export ` prefixes and quoted values.
+func loadEnvFile() {
+	var paths []string
+	if p := os.Getenv("PILOT_ENV"); p != "" {
+		paths = append(paths, p)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".pilot.env"))
+	}
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(string(b), "\n") {
+			ln = strings.TrimSpace(ln)
+			ln = strings.TrimSpace(strings.TrimPrefix(ln, "export "))
+			if ln == "" || strings.HasPrefix(ln, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(ln, "=")
+			if !ok {
+				continue
+			}
+			k = strings.TrimSpace(k)
+			v = strings.Trim(strings.TrimSpace(v), `"'`)
+			if k != "" && os.Getenv(k) == "" {
+				os.Setenv(k, v)
+			}
+		}
+	}
+}
+
 func main() {
 	model := flag.String("model", "", "model tag (default: provider-specific)")
 	provider := flag.String("provider", "deepseek", "brain provider: deepseek | ollama")
@@ -80,6 +115,17 @@ func main() {
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
 	flag.Parse()
+	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
+	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
+	// no need to pass -kosaten by hand (office has no local kosaten; omarchy does).
+	if *kosatenURL == "http://localhost:3942" {
+		cl := &http.Client{Timeout: 1500 * time.Millisecond}
+		if r, e := cl.Get("http://localhost:3942/health"); e != nil || r.StatusCode != 200 {
+			*kosatenURL = "https://mcp.kosaten.ai/mcp"
+		} else {
+			r.Body.Close()
+		}
+	}
 
 	// Brain selection. Default is DeepSeek — pilot is the Claude-independent door:
 	// a DeepSeek-driven REPL ("a you that isn't you"). Its own provider definition;
