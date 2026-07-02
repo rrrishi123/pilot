@@ -26,6 +26,7 @@ type lineReader struct {
 	fd       int
 	histFile string
 	hist     []string
+	curRow   int // which render row the cursor is on (for multi-line redraw)
 }
 
 func newLineReader(histFile string) *lineReader {
@@ -54,23 +55,37 @@ func (lr *lineReader) saveHistory() {
 	}
 }
 
-// render redraws the single visible line: prompt + buffer (with '\n' shown as ↵), then
-// parks the cursor at its column.
+// render redraws the input across REAL lines: the prompt on the first row, each '\n'
+// starting a new terminal row, then parks the cursor at its row/col. curRow tracks
+// where the cursor sits so the next redraw returns to the top-left before clearing.
 func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
-	disp := make([]rune, 0, len(buf))
-	for _, r := range buf {
-		if r == '\n' {
-			disp = append(disp, '↵')
+	if lr.curRow > 0 { // go to the top of the previous render
+		fmt.Fprintf(os.Stdout, "\033[%dA", lr.curRow)
+	}
+	fmt.Fprint(os.Stdout, "\r\033[J") // col 0, clear everything below
+	fmt.Fprint(os.Stdout, prompt+strings.ReplaceAll(string(buf), "\n", "\r\n"))
+	lastRow := strings.Count(string(buf), "\n")
+	// cursor's target row/col within the buffer
+	row, col := 0, 0
+	for i := 0; i < cursor && i < len(buf); i++ {
+		if buf[i] == '\n' {
+			row, col = row+1, 0
 		} else {
-			disp = append(disp, r)
+			col++
 		}
 	}
-	fmt.Fprintf(os.Stdout, "\r\033[K%s%s", prompt, string(disp))
-	if col := len([]rune(prompt)) + cursor; col > 0 {
-		fmt.Fprintf(os.Stdout, "\r\033[%dC", col)
-	} else {
-		fmt.Fprint(os.Stdout, "\r")
+	if up := lastRow - row; up > 0 { // move up from the end row to the cursor's row
+		fmt.Fprintf(os.Stdout, "\033[%dA", up)
 	}
+	fmt.Fprint(os.Stdout, "\r")
+	tcol := col
+	if row == 0 {
+		tcol += len([]rune(prompt))
+	}
+	if tcol > 0 {
+		fmt.Fprintf(os.Stdout, "\033[%dC", tcol)
+	}
+	lr.curRow = row
 }
 
 // readEscSeq reads the rest of a CSI/escape sequence after ESC, up to and including its
@@ -126,6 +141,7 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 	fmt.Fprint(os.Stdout, prompt+"\033[?2004h") // draw prompt + enable bracketed paste
 	defer fmt.Fprint(os.Stdout, "\033[?2004l")
 
+	lr.curRow = 0
 	var buf []rune
 	cursor := 0
 	histIdx := len(lr.hist)
@@ -144,13 +160,19 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			return "", err
 		}
 		switch r {
-		case '\r', '\n': // SUBMIT
+		case '\r': // Enter → SUBMIT
+			if down := strings.Count(string(buf), "\n") - lr.curRow; down > 0 {
+				fmt.Fprintf(os.Stdout, "\033[%dB", down) // drop below the whole input first
+			}
 			fmt.Fprint(os.Stdout, "\r\n")
+			lr.curRow = 0
 			line := string(buf)
 			if record && strings.TrimSpace(line) != "" {
 				lr.hist = append(lr.hist, line)
 			}
 			return line, nil
+		case '\n': // Ctrl-J (and Shift-Enter where the terminal sends LF) → add a line
+			insert([]rune{'\n'})
 		case 3: // Ctrl-C
 			fmt.Fprint(os.Stdout, "\r\n")
 			return "", errAborted
@@ -220,6 +242,8 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 				if cursor < len(buf) {
 					buf = append(buf[:cursor], buf[cursor+1:]...)
 				}
+			case "[13;2u", "[27;2;13~": // Shift-Enter (kitty / modifyOtherKeys) → add a line
+				insert([]rune{'\n'})
 			case "[200~": // BRACKETED PASTE — insert as content, don't submit
 				insert([]rune(lr.readPaste()))
 			}
