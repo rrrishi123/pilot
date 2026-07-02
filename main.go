@@ -177,17 +177,21 @@ func main() {
 	}
 	tools := append(wireTools, builtinTools()...) // wire + host built-ins, merged for the model
 
-	// Native kosaten bridge — a curated, lean set of the organism's tools (BUILD NOW,
-	// per the council; lean, per pilot). Optional: needs -kosaten URL + KOSATEN_API_KEY.
-	var kos *httpMCP
-	if *kosatenURL != "" {
-		if k, ktools, err := startKosaten(*kosatenURL, os.Getenv("KOSATEN_API_KEY")); err != nil {
-			fmt.Fprintf(os.Stderr, "\033[2mpilot: kosaten bridge off (%v)\033[0m\n", err)
-		} else {
-			kos = k
-			tools = append(tools, ktools...)
-			fmt.Fprintf(os.Stderr, "\033[2mkosaten: bridged %d curated tools from %s\033[0m\n", len(ktools), *kosatenURL)
+	// GENERIC MCP BRIDGES — declared in config ($PILOT_MCP or ~/.pilot/mcp.json), NOT in
+	// code, so a new local/cloud MCP is added by config. The same binary runs anywhere:
+	// each server that isn't reachable is skipped (office has local ltqa + hosted kosaten;
+	// omarchy has local kosaten; a stranger has their own — no code change for any of it).
+	// -kosaten is kept as a built-in fallback spec when no config file exists.
+	bridges := map[string]*httpMCP{} // "<name>_" prefix -> bridged server, for call routing
+	for _, sp := range loadMCPSpecs(*kosatenURL) {
+		h, mtools, err := startMCP(sp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[2mpilot: mcp %q off (%v)\033[0m\n", sp.Name, err)
+			continue
 		}
+		bridges[sp.Name+"_"] = h
+		tools = append(tools, mtools...)
+		fmt.Fprintf(os.Stderr, "\033[2mmcp: bridged %d tools from %s (%s)\033[0m\n", len(mtools), sp.Name, sp.URL)
 	}
 
 	sysPrompt := system
@@ -213,7 +217,7 @@ func main() {
 	repl(&session{
 		base: base, model: mdl, provider: *provider, apiKey: apiKey,
 		flashModel: flashModel, proModel: proModel, router: routerOn,
-		mcp: mcp, kos: kos, castleFile: *castle, tools: tools, maxSteps: *maxSteps,
+		mcp: mcp, bridges: bridges, castleFile: *castle, tools: tools, maxSteps: *maxSteps,
 		showThinking: *showThinking, autoYes: *autoYes, lean: *lean, logPath: *logPath,
 		noReadline: *noReadline,
 		msgs: msgs,
@@ -233,7 +237,7 @@ type session struct {
 	turnThinking bool   // whether to enable reasoning this turn
 	turnEffort   string // reasoning_effort when thinking
 	mcp          *mcpServer
-	kos          *httpMCP // native bridge to kosaten's curated MCP tools
+	bridges      map[string]*httpMCP // "<name>_" prefix -> bridged MCP server (config-driven)
 	castleFile   string   // if set, dump the session here each turn for the block-world UI
 	tools        []map[string]any
 	turnTools    []map[string]any // tools offered this turn (scoped when lean)
@@ -888,6 +892,46 @@ var kosatenTools = map[string]bool{
 	"get_pulse": true, "digest": true,
 }
 
+// mcpSpec declares one MCP server to bridge — in CONFIG, not code. url is the HTTP MCP
+// endpoint; key_env names the env var holding a bearer token (optional); tools is an
+// optional allowlist ([] = expose all). name becomes the "<name>_" tool prefix.
+type mcpSpec struct {
+	Name   string   `json:"name"`
+	URL    string   `json:"url"`
+	KeyEnv string   `json:"key_env"`
+	Tools  []string `json:"tools"`
+}
+
+// loadMCPSpecs reads the bridge list from $PILOT_MCP (or ~/.pilot/mcp.json). This is how
+// a new local/cloud MCP is added — edit config, not pilot. If no config file exists it
+// falls back to a single kosaten spec from -kosaten (backward compat). Unreachable
+// servers are skipped by the caller, so one config works on every machine.
+func loadMCPSpecs(kosatenURL string) []mcpSpec {
+	var paths []string
+	if p := os.Getenv("PILOT_MCP"); p != "" {
+		paths = append(paths, p)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".pilot", "mcp.json"))
+	}
+	for _, p := range paths {
+		if b, err := os.ReadFile(p); err == nil {
+			var specs []mcpSpec
+			if json.Unmarshal(b, &specs) == nil && len(specs) > 0 {
+				return specs
+			}
+		}
+	}
+	if kosatenURL != "" { // fallback: the built-in kosaten default (lean allowlist)
+		allow := make([]string, 0, len(kosatenTools))
+		for k := range kosatenTools {
+			allow = append(allow, k)
+		}
+		return []mcpSpec{{Name: "kosaten", URL: kosatenURL, KeyEnv: "KOSATEN_API_KEY", Tools: allow}}
+	}
+	return nil
+}
+
 type httpMCP struct {
 	url, key, sid string
 	id            int
@@ -951,10 +995,11 @@ func (h *httpMCP) notify(method string) {
 	}
 }
 
-// startKosaten connects to kosaten's MCP and returns the curated tool surface
-// (prefixed "kosaten_") to merge into pilot's tools.
-func startKosaten(url, key string) (*httpMCP, []map[string]any, error) {
-	h := &httpMCP{url: url, key: key}
+// startMCP connects to one MCP server and returns its tools (optionally allow-listed),
+// each prefixed with sp.Name+"_". Generic — the same path bridges kosaten, ltqa-local,
+// or any client's own MCP; adding one is config (see loadMCPSpecs), not code.
+func startMCP(sp mcpSpec) (*httpMCP, []map[string]any, error) {
+	h := &httpMCP{url: sp.URL, key: os.Getenv(sp.KeyEnv)}
 	_, sid, err := h.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
 		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
@@ -978,10 +1023,14 @@ func startKosaten(url, key string) (*httpMCP, []map[string]any, error) {
 	if err := json.Unmarshal(res, &tl); err != nil {
 		return nil, nil, err
 	}
+	allow := map[string]bool{}
+	for _, t := range sp.Tools {
+		allow[t] = true
+	}
 	var tools []map[string]any
 	for _, t := range tl.Tools {
-		if !kosatenTools[t.Name] {
-			continue // curation: lean surface only
+		if len(allow) > 0 && !allow[t.Name] {
+			continue // allowlist ([] = expose all)
 		}
 		var schema any = map[string]any{"type": "object", "properties": map[string]any{}}
 		if len(t.InputSchema) > 0 {
@@ -990,8 +1039,8 @@ func startKosaten(url, key string) (*httpMCP, []map[string]any, error) {
 		tools = append(tools, map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        "kosaten_" + t.Name,
-				"description": "[kosaten organism] " + t.Description,
+				"name":        sp.Name + "_" + t.Name,
+				"description": "[" + sp.Name + "] " + t.Description,
 				"parameters":  schema,
 			},
 		})
@@ -1092,13 +1141,17 @@ func (s *session) dispatch(name string, args map[string]any) (string, error) {
 	if out, ok := s.callBuiltin(name, args); ok {
 		return out, nil
 	}
-	// Native kosaten tools (bridged, prefixed kosaten_) route to the organism.
-	if s.kos != nil && strings.HasPrefix(name, "kosaten_") {
-		out, err := s.kos.callTool(strings.TrimPrefix(name, "kosaten_"), args)
-		if err != nil {
-			return "", err
+	// Bridged MCP tools route to the right server by their "<name>_" prefix — generic,
+	// so any config-declared MCP (kosaten, ltqa-local, a client's own) works with no
+	// code change here.
+	for prefix, h := range s.bridges {
+		if strings.HasPrefix(name, prefix) {
+			out, err := h.callTool(strings.TrimPrefix(name, prefix), args)
+			if err != nil {
+				return "", err
+			}
+			return clip(out, 24000), nil
 		}
-		return clip(out, 24000), nil
 	}
 	// Clip wire/MCP results too — an unclipped http_request body (e.g. a big JSON
 	// endpoint) accumulates in the message log and blows the model's context window.
