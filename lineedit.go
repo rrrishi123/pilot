@@ -107,7 +107,6 @@ func (lr *lineReader) readEscSeq() string {
 			break
 		}
 		sb.WriteByte(b)
-		// final byte: >= 0x40 (but '[' and 'O' are CSI/SS3 introducers)
 		if b >= 0x40 && b <= 0x7e && b != '[' && b != 'O' {
 			break
 		}
@@ -187,10 +186,9 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			return "", err
 		}
 
-		// ── control characters ────────────────────────────────────────────
 		switch r {
 
-		case '\r': // Enter
+		case '\r': // Enter — submit, or line-continuation via trailing \
 			s := strings.TrimRight(string(buf), " ")
 			if strings.HasSuffix(s, "\\") && len(s) > 0 {
 				trail := len(buf) - len([]rune(s)) + 1
@@ -211,45 +209,43 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			}
 			return line, nil
 
-		case '\n': // Ctrl+J → newline
-			buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
-			cursor++
-
-		case 3: // Ctrl+C
+		case 3: // Ctrl+C — abort
 			fmt.Fprint(os.Stdout, "\r\n")
 			return "", errAborted
 
-		case 4: // Ctrl+D
+		case 4: // Ctrl+D — EOF on empty, ignored on non-empty
 			if len(buf) == 0 {
 				fmt.Fprint(os.Stdout, "\r\n")
 				return "", io.EOF
 			}
+			// non-empty: fall through — no-op, still re-render
 
-		case 127, 8: // Backspace
+		case '\n': // Ctrl+J — newline
+			buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
+			cursor++
+
+		case 127, 8: // Backspace (DEL, BS)
 			if cursor > 0 {
 				buf = append(buf[:cursor-1], buf[cursor:]...)
 				cursor--
 			}
 
-		case 1: // Ctrl+A
+		case 1: // Ctrl+A — start of line
 			cursor = 0
-		case 5: // Ctrl+E
+		case 5: // Ctrl+E — end of line
 			cursor = len(buf)
-		case 21: // Ctrl+U
+		case 21: // Ctrl+U — kill to start
 			buf = append([]rune{}, buf[cursor:]...)
 			cursor = 0
-		case 11: // Ctrl+K
+		case 11: // Ctrl+K — kill to end
 			buf = buf[:cursor]
-		case 23: // Ctrl+W → delete word back
+		case 23: // Ctrl+W — delete word back
 			buf, cursor = killWordBack(buf, cursor)
 
-		// ── escape sequences ──────────────────────────────────────────────
-		case 27:
+		case 27: // ESC — read the rest
 			seq := lr.readEscSeq()
-			seqHandled := false
 
 			switch seq {
-
 			// arrows
 			case "[A":
 				if histIdx == len(lr.hist) {
@@ -260,7 +256,6 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 					buf = []rune(lr.hist[histIdx])
 					cursor = len(buf)
 				}
-				seqHandled = true
 			case "[B":
 				if histIdx < len(lr.hist) {
 					histIdx++
@@ -271,105 +266,69 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 					}
 					cursor = len(buf)
 				}
-				seqHandled = true
-			case "[C": // right
+			case "[C":
 				if cursor < len(buf) {
 					cursor++
 				}
-				seqHandled = true
-			case "[D": // left
+			case "[D":
 				if cursor > 0 {
 					cursor--
 				}
-				seqHandled = true
 
-			// Home / End (CSI, vt100, SS3)
+			// Home / End
 			case "[H", "[1~", "OH":
 				cursor = 0
-				seqHandled = true
 			case "[F", "[4~", "OF":
 				cursor = len(buf)
-				seqHandled = true
 
 			// Delete
 			case "[3~":
 				if cursor < len(buf) {
 					buf = append(buf[:cursor], buf[cursor+1:]...)
 				}
-				seqHandled = true
 
-			// ── word-left ───────────────────────────────────────────────
-			// iTerm2 default:       ESC+b
-			// Terminal.app:         ESC+b
-			// xterm modifyOtherKeys: [1;5D (Ctrl) / [1;3D (Alt)
-			// Windows Terminal:     [1;5D / [1;3D
-			// kitty:                [27;5;113~ (Ctrl) / [27;3;113~ (Alt)
+			// word-left: ESC+b (iTerm2 default), CSI, kitty
 			case "b":
 				cursor = wordLeftPos(buf, cursor)
-				seqHandled = true
-			case "[1;3D", "[1;5D", "[1;4D", "[1;6D":
+			case "[1;3D", "[1;5D", "[1;4D", "[1;6D", "[5D":
 				cursor = wordLeftPos(buf, cursor)
-				seqHandled = true
-			case "[5D", "[5C":
-				cursor = wordLeftPos(buf, cursor)
-				seqHandled = true
 			case "[27;5;113~", "[27;3;113~":
 				cursor = wordLeftPos(buf, cursor)
-				seqHandled = true
 
-			// ── word-right ──────────────────────────────────────────────
+			// word-right: ESC+f, CSI, kitty
 			case "f":
 				cursor = wordRightPos(buf, cursor)
-				seqHandled = true
-			case "[1;3C", "[1;5C", "[1;4C", "[1;6C":
+			case "[1;3C", "[1;5C", "[1;4C", "[1;6C", "[5C":
 				cursor = wordRightPos(buf, cursor)
-				seqHandled = true
 			case "[27;5;115~", "[27;3;115~":
 				cursor = wordRightPos(buf, cursor)
-				seqHandled = true
 
-			// ── delete-word-back (Ctrl+Backspace / Alt+Backspace / Opt+⌫)
-			// xterm:          ESC+DEL (\x1b\x7f) or ESC+BS (\x1b\x08)
-			// iTerm2 default: ESC+DEL (\x1b\x7f)
-			// Terminal.app:   ESC+DEL
-			// kitty:          [27;5;127~ or [8;127u or [27;3;127~
-			case "\x7f", "\x08":
+			// delete-word-back: Ctrl+Backspace / Alt+Backspace / Opt+Backspace
+			case "\x7f", "\x08": // ESC+DEL / ESC+BS (xterm, iTerm2)
 				buf, cursor = killWordBack(buf, cursor)
-				seqHandled = true
-			case "[8;127u", "[127;8u":
+			case "[8;127u", "[127;8u": // kitty CSI u
 				buf, cursor = killWordBack(buf, cursor)
-				seqHandled = true
-			case "[27;8;127~", "[27;5;127~", "[27;3;127~":
+			case "[27;8;127~", "[27;5;127~", "[27;3;127~": // kitty modifyOtherKeys
 				buf, cursor = killWordBack(buf, cursor)
-				seqHandled = true
 
-			// ── delete-word-forward (Alt+d / Meta+d / Opt+⌦) ──────────
+			// delete-word-forward: Alt+d / Opt+⌦
 			case "d":
 				buf, cursor = killWordForward(buf, cursor)
-				seqHandled = true
 
-			// ── newline via Shift+Enter / Alt+Enter ────────────────────
-			case "[27;2;13~", "[13;2u":
+			// newline: Shift+Enter, Alt+Enter
+			case "[27;2;13~", "[13;2u", "\r":
 				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 				cursor++
-				seqHandled = true
-			case "\r": // Alt+Enter = ESC+Enter
-				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
-				cursor++
-				seqHandled = true
 			}
 
-			if seqHandled {
-				lr.render(prompt, buf, cursor)
-			}
-
-		// ── printable characters ──────────────────────────────────────────
 		default:
 			if r >= 32 {
 				buf = append(buf[:cursor], append([]rune{r}, buf[cursor:]...)...)
 				cursor++
 			}
-			lr.render(prompt, buf, cursor)
 		}
+
+		// Every path that didn't return renders once here.
+		lr.render(prompt, buf, cursor)
 	}
 }
