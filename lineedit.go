@@ -15,10 +15,11 @@ var errAborted = errors.New("line aborted")
 var errInterrupted = errors.New("turn interrupted — edit and resubmit")
 
 // lineReader is a plain raw-mode line editor — no selection, no bracketed paste,
-// no shift+arrow gymnastics. Supports typing, Backspace/Delete, Enter to submit (\ at line end → continue on next line)
-// (with \ continuation), Ctrl+J / Shift+Enter for newline, Ctrl+A/E/U/K/W,
-// arrows, Home/End, Up/Down history, Ctrl+C abort, Ctrl+D EOF.
-// Multi-line input renders across real terminal rows.
+// no shift+arrow gymnastics. Supports typing, Backspace/Delete, Ctrl+W / Ctrl+Backspace
+// (delete word back), Enter to submit (\ at line end → continue on next line),
+// Ctrl+J / Shift+Enter for newline, Ctrl+A/E/U/K, arrows, Home/End, Up/Down
+// history, Ctrl+C abort, Ctrl+D EOF. Multi-line input renders across real
+// terminal rows.
 type lineReader struct {
 	in       *bufio.Reader
 	fd       int
@@ -98,6 +99,8 @@ func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
 // readEscSeq reads the bytes after ESC. Returns the complete sequence string.
 // CSI: ESC [ … final (>= 0x40, except '[' itself and 'O')
 // SS3:  ESC O final (one more byte)
+// Also returns bare final bytes (no CSI/SS3 prefix) — e.g. Ctrl+Backspace
+// sends \x1b\x7f (ESC + DEL); the seq returned is "\x7f".
 func (lr *lineReader) readEscSeq() string {
 	var sb strings.Builder
 	for {
@@ -116,6 +119,18 @@ func (lr *lineReader) readEscSeq() string {
 		}
 	}
 	return sb.String()
+}
+
+// deleteWordBack removes the word before the cursor, like readline's backward-kill-word.
+func (lr *lineReader) deleteWordBack(buf []rune, cursor int) ([]rune, int) {
+	i := cursor
+	for i > 0 && buf[i-1] == ' ' {
+		i--
+	}
+	for i > 0 && buf[i-1] != ' ' {
+		i--
+	}
+	return append(buf[:i], buf[cursor:]...), i
 }
 
 func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
@@ -187,7 +202,7 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			}
 			// non-empty: ignored (like readline)
 
-		case 127, 8: // Backspace
+		case 127, 8: // Backspace (DEL, BS)
 			if cursor > 0 {
 				buf = append(buf[:cursor-1], buf[cursor:]...)
 				cursor--
@@ -203,18 +218,10 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			cursor = 0
 		case 11: // Ctrl+K → kill to end
 			buf = buf[:cursor]
-		case 23: // Ctrl+W → delete word back
-			i := cursor
-			for i > 0 && buf[i-1] == ' ' {
-				i--
-			}
-			for i > 0 && buf[i-1] != ' ' {
-				i--
-			}
-			buf = append(buf[:i], buf[cursor:]...)
-			cursor = i
+		case 23: // Ctrl+W → delete word back (classic terminal)
+			buf, cursor = lr.deleteWordBack(buf, cursor)
 
-		case 27: // Escape → CSI / SS3 sequence
+		case 27: // Escape → CSI / SS3 / meta sequence
 			switch lr.readEscSeq() {
 			case "[A": // Up
 				if histIdx == len(lr.hist) {
@@ -262,6 +269,11 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 				nb = append(nb, buf[cursor:]...)
 				buf = nb
 				cursor++
+			// Ctrl+Backspace — terminals send one of these:
+			case "\x7f", "\x08": // ESC + DEL / ESC + BS (xterm, most terminals)
+				buf, cursor = lr.deleteWordBack(buf, cursor)
+			case "[8;127u", "[127;8u", "[27;8;127~": // kitty CSI u / xterm modifyOtherKeys
+				buf, cursor = lr.deleteWordBack(buf, cursor)
 			// unrecognised → silently skip
 			}
 
