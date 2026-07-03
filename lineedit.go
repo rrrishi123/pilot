@@ -14,19 +14,25 @@ import (
 var errAborted = errors.New("line aborted")
 var errInterrupted = errors.New("turn interrupted — edit and resubmit")
 
-// lineReader is a plain raw-mode line editor — no selection, no bracketed paste,
-// no shift+arrow gymnastics. Supports typing, Backspace/Delete, Ctrl+W / Ctrl+Backspace
-// (delete word back), Enter to submit (\ at line end → continue on next line),
-// Ctrl+J / Shift+Enter for newline, Ctrl+A/E/U/K, arrows, Home/End, Up/Down
-// history, Ctrl+C abort, Ctrl+D EOF. Multi-line input renders across real
-// terminal rows.
+// lineReader is a terminal line editor. Designed portably: understands the three
+// wire formats that iTerm2 (Mac), Terminal.app (Mac), xterm/gnome-terminal
+// (Linux), kitty (Linux), and Windows Terminal all use:
+//
+//	Control char     e.g. Ctrl+W = 0x17, plain Backspace = 0x7f
+//	ESC+letter       emacs meta: Alt+b = ESC+b = word-left (iTerm2 default)
+//	                 Alt+f = ESC+f = word-right, Alt+d = delete-word-forward
+//	CSI sequence     ESC [ ... (cursor keys, Home/End, modified variants)
+//
+// iTerm2 ships with "Left/Right Option key acts as +Esc" by default — so Mac
+// users get Alt+b/f for word-move out of the box. If they switch to "Send CSI
+// sequence", the CSI variants work too.
 type lineReader struct {
 	in       *bufio.Reader
 	fd       int
 	histFile string
 	hist     []string
-	curRow   int    // which render row the cursor is on
-	preload  string // if set, start with this content (for interrupt recovery)
+	curRow   int
+	preload  string // set by interrupt recovery
 }
 
 func newLineReader(histFile string) *lineReader {
@@ -55,34 +61,30 @@ func (lr *lineReader) saveHistory() {
 	}
 }
 
-// render clears the previous render and redraws prompt + buffer, then parks the
-// cursor at the correct row/col. No selection rendering — simple.
+// render draws the prompt + buffer, parks the cursor.
 func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
 	if lr.curRow > 0 {
 		fmt.Fprintf(os.Stdout, "\033[%dA", lr.curRow)
 	}
-	fmt.Fprint(os.Stdout, "\r\033[J") // col 0, clear below
+	fmt.Fprint(os.Stdout, "\r\033[J")
 	fmt.Fprint(os.Stdout, prompt)
-
 	for _, ch := range buf {
 		if ch == '\n' {
 			fmt.Fprint(os.Stdout, "\r\n")
-			continue
+		} else {
+			fmt.Fprint(os.Stdout, string(ch))
 		}
-		fmt.Fprint(os.Stdout, string(ch))
 	}
-
-	// Cursor row/col within the buffer
 	row, col := 0, 0
 	for i := 0; i < cursor && i < len(buf); i++ {
 		if buf[i] == '\n' {
-			row, col = row+1, 0
+			row++
+			col = 0
 		} else {
 			col++
 		}
 	}
-	lastRow := strings.Count(string(buf), "\n")
-	if up := lastRow - row; up > 0 {
+	if up := strings.Count(string(buf), "\n") - row; up > 0 {
 		fmt.Fprintf(os.Stdout, "\033[%dA", up)
 	}
 	fmt.Fprint(os.Stdout, "\r")
@@ -96,11 +98,7 @@ func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
 	lr.curRow = row
 }
 
-// readEscSeq reads the bytes after ESC. Returns the complete sequence string.
-// CSI: ESC [ … final (>= 0x40, except '[' itself and 'O')
-// SS3:  ESC O final (one more byte)
-// Also returns bare final bytes (no CSI/SS3 prefix) — e.g. Ctrl+Backspace
-// sends \x1b\x7f (ESC + DEL); the seq returned is "\x7f".
+// readEscSeq reads bytes after ESC. Returns the full sequence string.
 func (lr *lineReader) readEscSeq() string {
 	var sb strings.Builder
 	for {
@@ -109,20 +107,40 @@ func (lr *lineReader) readEscSeq() string {
 			break
 		}
 		sb.WriteByte(b)
-		// A final byte is >= 0x40, but '[' (0x5B) and 'O' (0x4F) are
-		// prefixes (CSI/SS3 introducers), not finals.
+		// final byte: >= 0x40 (but '[' and 'O' are CSI/SS3 introducers)
 		if b >= 0x40 && b <= 0x7e && b != '[' && b != 'O' {
 			break
 		}
-		if b < 0x20 { // control chars (e.g. \r, \n for meta combos)
+		if b < 0x20 {
 			break
 		}
 	}
 	return sb.String()
 }
 
-// deleteWordBack removes the word before the cursor, like readline's backward-kill-word.
-func (lr *lineReader) deleteWordBack(buf []rune, cursor int) ([]rune, int) {
+// ── word helpers ──────────────────────────────────────────────────────────────
+
+func wordLeftPos(buf []rune, pos int) int {
+	for pos > 0 && buf[pos-1] == ' ' {
+		pos--
+	}
+	for pos > 0 && buf[pos-1] != ' ' {
+		pos--
+	}
+	return pos
+}
+
+func wordRightPos(buf []rune, pos int) int {
+	for pos < len(buf) && buf[pos] != ' ' {
+		pos++
+	}
+	for pos < len(buf) && buf[pos] == ' ' {
+		pos++
+	}
+	return pos
+}
+
+func killWordBack(buf []rune, cursor int) ([]rune, int) {
 	i := cursor
 	for i > 0 && buf[i-1] == ' ' {
 		i--
@@ -133,6 +151,19 @@ func (lr *lineReader) deleteWordBack(buf []rune, cursor int) ([]rune, int) {
 	return append(buf[:i], buf[cursor:]...), i
 }
 
+func killWordForward(buf []rune, cursor int) ([]rune, int) {
+	i := cursor
+	for i < len(buf) && buf[i] == ' ' {
+		i++
+	}
+	for i < len(buf) && buf[i] != ' ' {
+		i++
+	}
+	return append(buf[:cursor], buf[i:]...), cursor
+}
+
+// ── main loop ─────────────────────────────────────────────────────────────────
+
 func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 	old, err := term.MakeRaw(lr.fd)
 	if err != nil {
@@ -141,7 +172,6 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 	}
 	defer term.Restore(lr.fd, old)
 
-	// Use preload if set (interrupt recovery)
 	buf := []rune(lr.preload)
 	lr.preload = ""
 	cursor := len(buf)
@@ -157,15 +187,13 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			return "", err
 		}
 
+		// ── control characters ────────────────────────────────────────────
 		switch r {
-		case '\r': // Enter → submit, or line continuation if trailing \
-			// Check for backslash continuation: if the last non-space
-			// char is \, replace it (and any trailing spaces) with a
-			// newline and keep reading.
-			bufTrim := strings.TrimRight(string(buf), " ")
-			if strings.HasSuffix(bufTrim, "\\") && len(bufTrim) > 0 {
-				// Backslash depth: how many chars after the last \?
-				trail := len(buf) - len([]rune(bufTrim)) + 1
+
+		case '\r': // Enter
+			s := strings.TrimRight(string(buf), " ")
+			if strings.HasSuffix(s, "\\") && len(s) > 0 {
+				trail := len(buf) - len([]rune(s)) + 1
 				buf = buf[:len(buf)-trail]
 				buf = append(buf, '\n')
 				cursor = len(buf)
@@ -183,15 +211,11 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			}
 			return line, nil
 
-		case '\n': // Ctrl+J → insert newline (Shift+Enter too, on terminals that send distinct escape seq)
-			nb := make([]rune, 0, len(buf)+1)
-			nb = append(nb, buf[:cursor]...)
-			nb = append(nb, '\n')
-			nb = append(nb, buf[cursor:]...)
-			buf = nb
+		case '\n': // Ctrl+J → newline
+			buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 			cursor++
 
-		case 3: // Ctrl+C → abort the line
+		case 3: // Ctrl+C
 			fmt.Fprint(os.Stdout, "\r\n")
 			return "", errAborted
 
@@ -200,30 +224,34 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 				fmt.Fprint(os.Stdout, "\r\n")
 				return "", io.EOF
 			}
-			// non-empty: ignored (like readline)
 
-		case 127, 8: // Backspace (DEL, BS)
+		case 127, 8: // Backspace
 			if cursor > 0 {
 				buf = append(buf[:cursor-1], buf[cursor:]...)
 				cursor--
 			}
 
-		case 1: // Ctrl+A → start
+		case 1: // Ctrl+A
 			cursor = 0
-		case 5: // Ctrl+E → end
+		case 5: // Ctrl+E
 			cursor = len(buf)
-
-		case 21: // Ctrl+U → kill to start
+		case 21: // Ctrl+U
 			buf = append([]rune{}, buf[cursor:]...)
 			cursor = 0
-		case 11: // Ctrl+K → kill to end
+		case 11: // Ctrl+K
 			buf = buf[:cursor]
-		case 23: // Ctrl+W → delete word back (classic terminal)
-			buf, cursor = lr.deleteWordBack(buf, cursor)
+		case 23: // Ctrl+W → delete word back
+			buf, cursor = killWordBack(buf, cursor)
 
-		case 27: // Escape → CSI / SS3 / meta sequence
-			switch lr.readEscSeq() {
-			case "[A": // Up
+		// ── escape sequences ──────────────────────────────────────────────
+		case 27:
+			seq := lr.readEscSeq()
+			seqHandled := false
+
+			switch seq {
+
+			// arrows
+			case "[A":
 				if histIdx == len(lr.hist) {
 					saved = append([]rune{}, buf...)
 				}
@@ -232,7 +260,8 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 					buf = []rune(lr.hist[histIdx])
 					cursor = len(buf)
 				}
-			case "[B": // Down
+				seqHandled = true
+			case "[B":
 				if histIdx < len(lr.hist) {
 					histIdx++
 					if histIdx == len(lr.hist) {
@@ -242,73 +271,105 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 					}
 					cursor = len(buf)
 				}
-			case "[C": // Right
+				seqHandled = true
+			case "[C": // right
 				if cursor < len(buf) {
 					cursor++
 				}
-			case "[D": // Left
+				seqHandled = true
+			case "[D": // left
 				if cursor > 0 {
 					cursor--
 				}
-			case "[H", "[1~", "OH": // Home (ANSI, vt100, SS3)
+				seqHandled = true
+
+			// Home / End (CSI, vt100, SS3)
+			case "[H", "[1~", "OH":
 				cursor = 0
-			case "[F", "[4~", "OF": // End (ANSI, vt100, SS3)
+				seqHandled = true
+			case "[F", "[4~", "OF":
 				cursor = len(buf)
-			case "[3~": // Delete
+				seqHandled = true
+
+			// Delete
+			case "[3~":
 				if cursor < len(buf) {
 					buf = append(buf[:cursor], buf[cursor+1:]...)
 				}
-			case "[1;5D": // Ctrl+Left
-				cursor = wordLeft(buf, cursor)
-			case "[1;5C": // Ctrl+Right
-				cursor = wordRight(buf, cursor)
-			case "[27;2;13~", "[13;2u": // Shift+Enter (xterm modifyOtherKeys / kitty CSI u)
-				nb := make([]rune, 0, len(buf)+1)
-				nb = append(nb, buf[:cursor]...)
-				nb = append(nb, '\n')
-				nb = append(nb, buf[cursor:]...)
-				buf = nb
+				seqHandled = true
+
+			// ── word-left ───────────────────────────────────────────────
+			// iTerm2 default:       ESC+b
+			// Terminal.app:         ESC+b
+			// xterm modifyOtherKeys: [1;5D (Ctrl) / [1;3D (Alt)
+			// Windows Terminal:     [1;5D / [1;3D
+			// kitty:                [27;5;113~ (Ctrl) / [27;3;113~ (Alt)
+			case "b":
+				cursor = wordLeftPos(buf, cursor)
+				seqHandled = true
+			case "[1;3D", "[1;5D", "[1;4D", "[1;6D":
+				cursor = wordLeftPos(buf, cursor)
+				seqHandled = true
+			case "[5D", "[5C":
+				cursor = wordLeftPos(buf, cursor)
+				seqHandled = true
+			case "[27;5;113~", "[27;3;113~":
+				cursor = wordLeftPos(buf, cursor)
+				seqHandled = true
+
+			// ── word-right ──────────────────────────────────────────────
+			case "f":
+				cursor = wordRightPos(buf, cursor)
+				seqHandled = true
+			case "[1;3C", "[1;5C", "[1;4C", "[1;6C":
+				cursor = wordRightPos(buf, cursor)
+				seqHandled = true
+			case "[27;5;115~", "[27;3;115~":
+				cursor = wordRightPos(buf, cursor)
+				seqHandled = true
+
+			// ── delete-word-back (Ctrl+Backspace / Alt+Backspace / Opt+⌫)
+			// xterm:          ESC+DEL (\x1b\x7f) or ESC+BS (\x1b\x08)
+			// iTerm2 default: ESC+DEL (\x1b\x7f)
+			// Terminal.app:   ESC+DEL
+			// kitty:          [27;5;127~ or [8;127u or [27;3;127~
+			case "\x7f", "\x08":
+				buf, cursor = killWordBack(buf, cursor)
+				seqHandled = true
+			case "[8;127u", "[127;8u":
+				buf, cursor = killWordBack(buf, cursor)
+				seqHandled = true
+			case "[27;8;127~", "[27;5;127~", "[27;3;127~":
+				buf, cursor = killWordBack(buf, cursor)
+				seqHandled = true
+
+			// ── delete-word-forward (Alt+d / Meta+d / Opt+⌦) ──────────
+			case "d":
+				buf, cursor = killWordForward(buf, cursor)
+				seqHandled = true
+
+			// ── newline via Shift+Enter / Alt+Enter ────────────────────
+			case "[27;2;13~", "[13;2u":
+				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 				cursor++
-			// Ctrl+Backspace — terminals send one of these:
-			case "\x7f", "\x08": // ESC + DEL / ESC + BS (xterm, most terminals)
-				buf, cursor = lr.deleteWordBack(buf, cursor)
-			case "[8;127u", "[127;8u", "[27;8;127~": // kitty CSI u / xterm modifyOtherKeys
-				buf, cursor = lr.deleteWordBack(buf, cursor)
-			// unrecognised → silently skip
+				seqHandled = true
+			case "\r": // Alt+Enter = ESC+Enter
+				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
+				cursor++
+				seqHandled = true
 			}
 
+			if seqHandled {
+				lr.render(prompt, buf, cursor)
+			}
+
+		// ── printable characters ──────────────────────────────────────────
 		default:
 			if r >= 32 {
-				nb := make([]rune, 0, len(buf)+1)
-				nb = append(nb, buf[:cursor]...)
-				nb = append(nb, r)
-				nb = append(nb, buf[cursor:]...)
-				buf = nb
+				buf = append(buf[:cursor], append([]rune{r}, buf[cursor:]...)...)
 				cursor++
 			}
+			lr.render(prompt, buf, cursor)
 		}
-		lr.render(prompt, buf, cursor)
 	}
-}
-
-// wordLeft returns the position after moving one word left from 'pos'.
-func wordLeft(buf []rune, pos int) int {
-	for pos > 0 && buf[pos-1] == ' ' {
-		pos--
-	}
-	for pos > 0 && buf[pos-1] != ' ' {
-		pos--
-	}
-	return pos
-}
-
-// wordRight returns the position after moving one word right from 'pos'.
-func wordRight(buf []rune, pos int) int {
-	for pos < len(buf) && buf[pos] != ' ' {
-		pos++
-	}
-	for pos < len(buf) && buf[pos] == ' ' {
-		pos++
-	}
-	return pos
 }
