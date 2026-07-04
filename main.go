@@ -898,6 +898,12 @@ func (s *session) appendRoom(user, answer string) {
 		f.Write(append(rec, '\n'))
 		f.Close()
 	}
+	// Write presence — so the castle canvas shows this pilot's avatar.
+	home, _ := os.UserHomeDir()
+	presDir := filepath.Join(home, ".pilot-castle-presence")
+	os.MkdirAll(presDir, 0755)
+	presFile := filepath.Join(presDir, fmt.Sprintf("pilot-%d", s.pid))
+	os.WriteFile(presFile, []byte(fmt.Sprintf("%d", s.turnCount)), 0644)
 }
 
 // pilotDir is where pilot's source + binary live (the build target).
