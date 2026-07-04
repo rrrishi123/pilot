@@ -36,6 +36,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -115,6 +116,7 @@ func main() {
 	noReadline := flag.Bool("no-readline", false, "disable readline line-editing (fall back to raw stdin)")
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
+	brood := flag.Int("brood", 0, "seconds idle before auto-checking peer mailbox (0=off)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
 	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
@@ -230,6 +232,11 @@ func main() {
 	sess.pid = os.Getpid()
 	sess.startTime = time.Now()
 	sess.binaryPath, _ = os.Executable()
+	sess.broodSecs = *brood
+	sess.lastHumanInput = time.Now()
+	home, _ := os.UserHomeDir()
+	sess.mailboxDir = filepath.Join(home, ".pilot", "mailbox")
+	os.MkdirAll(sess.mailboxDir, 0700)
 	repl(sess, toolNames(tools), bin)
 }
 
@@ -268,6 +275,9 @@ type session struct {
 	startTime    time.Time         // when this pilot was launched
 	binaryPath   string            // path to the running binary
 	turnCount    int               // turns taken since launch
+	broodSecs      int            // seconds idle before brood activation (0=off)
+	lastHumanInput time.Time     // last time a real human typed something
+	mailboxDir     string         // ~/.pilot/mailbox — peer message files
 }
 
 func repl(s *session, names []string, bin string) {
@@ -287,8 +297,8 @@ func repl(s *session, names []string, bin string) {
 	}()
 
 	if s.interactive && !s.noReadline {
-		home, _ := os.UserHomeDir()
-		s.lr = newLineReader(filepath.Join(home, ".pilot_history"))
+		home2, _ := os.UserHomeDir()
+		s.lr = newLineReader(filepath.Join(home2, ".pilot_history"))
 	} else {
 		s.in = bufio.NewReader(os.Stdin)
 	}
@@ -301,6 +311,12 @@ func repl(s *session, names []string, bin string) {
 		}
 	}
 	for {
+		// Brood: if idle > broodSecs, inject a peer-check pulse
+		if s.broodSecs > 0 && s.interactive && time.Since(s.lastHumanInput) > time.Duration(s.broodSecs)*time.Second {
+			fmt.Fprintf(os.Stderr, "\033[2mbrood pulse — checking peers after %ds idle\033[0m\n", s.broodSecs)
+			s.turn("[brood pulse] check your mailbox (pilot_poll) and talk to any peers who sent messages. if mailbox is empty, say 'quiet — no messages.'")
+			continue
+		}
 		var line string
 		var err error
 		if s.lr != nil {
@@ -321,6 +337,9 @@ func repl(s *session, names []string, bin string) {
 			return // EOF (Ctrl-D) or a real readline failure
 		}
 		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "[brood") {
+			s.lastHumanInput = time.Now()
+		}
 		if line != "" {
 			switch line {
 			case "/redeploy":
@@ -1231,6 +1250,21 @@ func builtinTools() []map[string]any {
 		fn("pilot_info",
 			"Return information about this pilot instance: PID, uptime, model, flags, turn count, castle file, and peer pilot processes visible on this machine. Use this to know yourself before asking about others.",
 			map[string]any{}),
+		fn("pilot_send",
+			"Send a message to another pilot instance. Writes to that pilot's mailbox file (~/.pilot/mailbox/TARGET_PID.jsonl). The target pilot must call pilot_poll() to read it.",
+			map[string]any{
+				"pid":     map[string]any{"type": "integer", "description": "Target pilot's PID."},
+				"message": str("The message to send."),
+			}, "pid", "message"),
+		fn("pilot_poll",
+			"Check your own mailbox for messages from peer pilots. Returns all unread messages and drains the mailbox. Call this when you receive a brood pulse or when you want to check if peers have reached out.",
+			map[string]any{}),
+		fn("pilot_spawn",
+			"Spawn a new pilot instance in a new tmux pane. The new pilot starts with the given initial instructions. Returns the new pilot's PID.",
+			map[string]any{
+				"instructions": str("First message/instructions for the new pilot. It will receive this as its first user input."),
+				"pane_dir":     str("Direction to split: v (vertical/below) or h (horizontal/right). Default: v."),
+			}, "instructions"),
 	}
 }
 
@@ -1347,6 +1381,12 @@ func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
 		return clip(sb.String(), 500_000), true
 	case "pilot_info":
 		return s.pilotInfo(), true
+	case "pilot_send":
+		return s.pilotSend(args), true
+	case "pilot_poll":
+		return s.pilotPoll(), true
+	case "pilot_spawn":
+		return s.pilotSpawn(args), true
 	}
 	return "", false // not a built-in — caller falls through to the wire
 }
@@ -1388,6 +1428,99 @@ func (s *session) pilotInfo() string {
 		fmt.Fprintf(&sb, "peers: 0\n")
 	}
 	return sb.String()
+}
+
+// pilotSend writes a message to a peer pilot's mailbox.
+func (s *session) pilotSend(args map[string]any) string {
+	pid := 0
+	if v, ok := args["pid"].(float64); ok {
+		pid = int(v)
+	}
+	if pid == 0 {
+		return "error: pid is required (integer)"
+	}
+	msg := argStr(args, "message")
+	if msg == "" {
+		return "error: message is required"
+	}
+	fpath := filepath.Join(s.mailboxDir, strconv.Itoa(pid)+".jsonl")
+	rec, _ := json.Marshal(map[string]any{
+		"from":    s.pid,
+		"time":    time.Now().UTC().Format(time.RFC3339),
+		"message": msg,
+	})
+	f, err := os.OpenFile(fpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer f.Close()
+	f.Write(append(rec, '\n'))
+	return fmt.Sprintf("sent to pilot %d (mailbox: %s)", pid, fpath)
+}
+
+// pilotPoll reads and drains this pilot's own mailbox. Returns all messages.
+func (s *session) pilotPoll() string {
+	fpath := filepath.Join(s.mailboxDir, strconv.Itoa(s.pid)+".jsonl")
+	b, err := os.ReadFile(fpath)
+	if err != nil {
+		return "mailbox empty (no messages)"
+	}
+	// Drain after reading
+	os.Remove(fpath)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "mailbox: %d message(s)\n", len(lines))
+	for i, ln := range lines {
+		if ln == "" {
+			continue
+		}
+		var m struct {
+			From    int    `json:"from"`
+			Time    string `json:"time"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(ln), &m) == nil {
+			fmt.Fprintf(&sb, "  [%d] from pid %d at %s: %s\n", i, m.From, m.Time, m.Message)
+		}
+	}
+	return sb.String()
+}
+
+// pilotSpawn spawns a new pilot in a new tmux pane with the given instructions.
+func (s *session) pilotSpawn(args map[string]any) string {
+	instructions := argStr(args, "instructions")
+	if instructions == "" {
+		return "error: instructions is required"
+	}
+	paneDir := argStr(args, "pane_dir")
+	if paneDir == "" {
+		paneDir = "v"
+	}
+	tmux := "tmux"
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return "error: tmux not found — pilot_spawn requires tmux"
+	}
+	// Quote instructions safely
+	bin := s.binaryPath
+	if bin == "" {
+		bin = "/home/rishi/Work/pilot/pilot"
+	}
+	// Write instructions to a temp file so the new pilot reads them as its first input
+	tmpf, err := os.CreateTemp("", "pilot-spawn-*.txt")
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	tmpf.WriteString(instructions + "\n")
+	tmpf.Close()
+	cmd := exec.Command(tmux, "split-window", "-"+paneDir, "-p", "30",
+		"-t", os.Getenv("TMUX_PANE"),
+		"sh", "-c", fmt.Sprintf("cd %s && %s -yes -castle %s -brood 60 < %s",
+			filepath.Dir(bin), bin, s.castleFile, tmpf.Name()))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("spawn failed: %v — %s", err, string(out))
+	}
+	return fmt.Sprintf("spawned new pilot with instructions from %s (will read when it starts). output: %s", tmpf.Name(), string(out))
 }
 
 // confirm asks before a mutating action. Uses readline when available,
