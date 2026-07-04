@@ -219,14 +219,18 @@ func main() {
 			os.Remove(*resume)
 		}
 	}
-	repl(&session{
+	sess := &session{
 		base: base, model: mdl, provider: *provider, apiKey: apiKey,
 		flashModel: flashModel, proModel: proModel, router: routerOn,
 		mcp: mcp, bridges: bridges, castleFile: *castle, tools: tools, maxSteps: *maxSteps,
 		showThinking: *showThinking, autoYes: *autoYes, lean: *lean, logPath: *logPath,
 		noReadline: *noReadline,
 		msgs: msgs,
-	}, toolNames(tools), bin)
+	}
+	sess.pid = os.Getpid()
+	sess.startTime = time.Now()
+	sess.binaryPath, _ = os.Executable()
+	repl(sess, toolNames(tools), bin)
 }
 
 // ---- conversation ----
@@ -260,6 +264,10 @@ type session struct {
 	cancel       context.CancelFunc         // cancel the in-flight API request on Ctrl+C
 	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
 	msgs         []message         // grows across turns; the dialogue is the state
+	pid          int               // this pilot's process ID
+	startTime    time.Time         // when this pilot was launched
+	binaryPath   string            // path to the running binary
+	turnCount    int               // turns taken since launch
 }
 
 func repl(s *session, names []string, bin string) {
@@ -350,6 +358,7 @@ func repl(s *session, names []string, bin string) {
 // and center.
 func (s *session) turn(userLine string) {
 	s.msgs = append(s.msgs, message{Role: "user", Content: userLine})
+	s.turnCount++
 
 	// Route this turn to the right brain: pro+thinking for hard/analytic work,
 	// flash for lookups and simple actions — think harder only when it's earned.
@@ -634,7 +643,7 @@ func (s *session) route(userLine string) {
 // plus its assistant/tool exchange), never the current one — so tool_call/result
 // pairs stay intact for the OpenAI/DeepSeek message format.
 func (s *session) compact() {
-	const budget = 300_000 // chars — safely under a 1M-token window
+	const budget = 2_000_000 // chars — under a 1M-token window (~4M chars avg) with headroom
 	size := func() int {
 		n := 0
 		for _, m := range s.msgs {
@@ -854,11 +863,18 @@ func (s *session) redeploy() {
 // appendRoom grows the block-world by one room — append-only, never truncated,
 // no cap on rooms or territory. The compaction in s.msgs keeps only the model's
 // render-distance; this file keeps the whole world (the memory that never drops).
+// Each entry now carries a session_id so the block-world can trace which pilot wrote
+// which rooms.
 func (s *session) appendRoom(user, answer string) {
 	if s.castleFile == "" {
 		return
 	}
-	rec, _ := json.Marshal(map[string]string{"user": user, "answer": answer})
+	rec, _ := json.Marshal(map[string]any{
+		"user":       user,
+		"answer":     answer,
+		"session_id": fmt.Sprintf("pid-%d", s.pid),
+		"time":       time.Now().UTC().Format(time.RFC3339),
+	})
 	if f, err := os.OpenFile(s.castleFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		f.Write(append(rec, '\n'))
 		f.Close()
@@ -1206,12 +1222,15 @@ func builtinTools() []map[string]any {
 				"command":         str("The shell command line to run."),
 				"timeout_seconds": map[string]any{"type": "integer", "description": "Kill the command after this many seconds (default 60)."},
 			}, "command"),
-		fn("read_file", "Read a text file from this Mac and return its contents (first 100 KB).",
+		fn("read_file", "Read a text file from this Mac and return its contents (first 1 MB).",
 			map[string]any{"path": str("Absolute or relative file path.")}, "path"),
 		fn("write_file", "Create or overwrite a text file on this machine.",
 			map[string]any{"path": str("File path to write."), "content": str("Full text to write.")}, "path", "content"),
 		fn("list_dir", "List the entries of a directory on this machine.",
 			map[string]any{"path": str("Directory path (defaults to the current directory).")}),
+		fn("pilot_info",
+			"Return information about this pilot instance: PID, uptime, model, flags, turn count, castle file, and peer pilot processes visible on this machine. Use this to know yourself before asking about others.",
+			map[string]any{}),
 	}
 }
 
@@ -1264,7 +1283,7 @@ func (s *session) dispatch(name string, args map[string]any) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			return clip(out, 24000), nil
+			return clip(out, 800_000), nil
 		}
 	}
 	// Clip wire/MCP results too — an unclipped http_request body (e.g. a big JSON
@@ -1273,7 +1292,7 @@ func (s *session) dispatch(name string, args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return clip(out, 24000), nil
+	return clip(out, 800_000), nil
 }
 
 func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
@@ -1294,14 +1313,14 @@ func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
 		if ctx.Err() == context.DeadlineExceeded {
 			res += fmt.Sprintf("\n[killed: exceeded %ds timeout]", secs)
 		}
-		return clip(res, 16000), true
+		return clip(res, 500_000), true
 	case "read_file":
 		p := argStr(args, "path")
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return "error: " + err.Error(), true
 		}
-		return clip(string(b), 100_000), true
+		return clip(string(b), 1_000_000), true
 	case "write_file":
 		p := argStr(args, "path")
 		if err := os.WriteFile(p, []byte(argStr(args, "content")), 0o644); err != nil {
@@ -1325,9 +1344,50 @@ func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
 			}
 			fmt.Fprintf(&sb, "%s  %s\n", kind, e.Name())
 		}
-		return clip(sb.String(), 16000), true
+		return clip(sb.String(), 500_000), true
+	case "pilot_info":
+		return s.pilotInfo(), true
 	}
 	return "", false // not a built-in — caller falls through to the wire
+}
+
+// pilotInfo returns the pilot's self-knowledge and any visible peers.
+func (s *session) pilotInfo() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "pid: %d\n", s.pid)
+	fmt.Fprintf(&sb, "binary: %s\n", s.binaryPath)
+	fmt.Fprintf(&sb, "uptime: %s\n", time.Since(s.startTime).Round(time.Second))
+	fmt.Fprintf(&sb, "model: %s (provider: %s)", s.model, s.provider)
+	if s.router {
+		fmt.Fprintf(&sb, ", router: flash=%s pro=%s", s.flashModel, s.proModel)
+	}
+	fmt.Fprintf(&sb, "\nturns: %d\n", s.turnCount)
+	fmt.Fprintf(&sb, "interactive: %v  autoYes: %v  lean: %v  showThinking: %v  noReadline: %v\n",
+		s.interactive, s.autoYes, s.lean, s.showThinking, s.noReadline)
+	fmt.Fprintf(&sb, "castle: %s\n", s.castleFile)
+	fmt.Fprintf(&sb, "bridges: %d\n", len(s.bridges))
+
+	// Peer discovery — find other pilots on this machine.
+	out, err := exec.Command("sh", "-c",
+		`ps aux | grep '[p]ilot' | awk '{for(i=11;i<=NF;i++)printf "%s ", $i; print ""}'`,
+	).CombinedOutput()
+	if err == nil && len(out) > 0 {
+		var peers []string
+		self := fmt.Sprintf("%d", s.pid)
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.Contains(line, self) {
+				peers = append(peers, line)
+			}
+		}
+		fmt.Fprintf(&sb, "peers: %d\n", len(peers))
+		for i, p := range peers {
+			fmt.Fprintf(&sb, "  [%d] %s\n", i, p)
+		}
+	} else {
+		fmt.Fprintf(&sb, "peers: 0\n")
+	}
+	return sb.String()
 }
 
 // confirm asks before a mutating action. Uses readline when available,
