@@ -117,6 +117,7 @@ func main() {
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
 	brood := flag.Int("brood", 0, "seconds idle before auto-checking peer mailbox (0=off)")
+	daemon := flag.Bool("daemon", false, "no-readline daemon mode: poll mailbox + act + sleep (implies -brood 60)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
 	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
@@ -221,12 +222,21 @@ func main() {
 			os.Remove(*resume)
 		}
 	}
+
+	// Daemon mode implies brood and no-readline
+	if *daemon {
+		if *brood == 0 {
+			*brood = 60
+		}
+		*noReadline = true
+	}
+
 	sess := &session{
 		base: base, model: mdl, provider: *provider, apiKey: apiKey,
 		flashModel: flashModel, proModel: proModel, router: routerOn,
 		mcp: mcp, bridges: bridges, castleFile: *castle, tools: tools, maxSteps: *maxSteps,
 		showThinking: *showThinking, autoYes: *autoYes, lean: *lean, logPath: *logPath,
-		noReadline: *noReadline,
+		noReadline: *noReadline, daemon: *daemon,
 		msgs: msgs,
 	}
 	sess.pid = os.Getpid()
@@ -237,7 +247,11 @@ func main() {
 	home, _ := os.UserHomeDir()
 	sess.mailboxDir = filepath.Join(home, ".pilot", "mailbox")
 	os.MkdirAll(sess.mailboxDir, 0700)
-	repl(sess, toolNames(tools), bin)
+	if *daemon {
+		sess.daemonLoop(bin)
+	} else {
+		repl(sess, toolNames(tools), bin)
+	}
 }
 
 // ---- conversation ----
@@ -265,6 +279,7 @@ type session struct {
 	interactive  bool
 	in           *bufio.Reader
 	noReadline   bool              // disable readline even when interactive
+	daemon       bool              // headless mode: no readline, poll-act-sleep loop
 	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
 	interruptLine string // the line to preload when returning to the prompt
 	savedLine    string                     // the line being processed (for interrupt recovery)
@@ -278,6 +293,90 @@ type session struct {
 	broodSecs      int            // seconds idle before brood activation (0=off)
 	lastHumanInput time.Time     // last time a real human typed something
 	mailboxDir     string         // ~/.pilot/mailbox — peer message files
+}
+
+// daemonLoop is a headless mailbox-polling loop. No readline, no stdin.
+// Polls mailbox every broodSecs/2 seconds. When messages arrive, runs
+// a turn to process them. Runs forever.
+func (s *session) daemonLoop(bin string) {
+	s.interactive = false
+	fmt.Fprintf(os.Stderr, "\033[2mdaemon mode — polling mailbox every %ds, no readline\033[0m\n", s.broodSecs/2)
+	// Catch SIGINT to exit cleanly
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "\033[2mdaemon: signal received, exiting\033[0m\n")
+		os.Exit(0)
+	}()
+	for {
+		fpath := filepath.Join(s.mailboxDir, strconv.Itoa(s.pid)+".jsonl")
+		if b, err := os.ReadFile(fpath); err == nil && len(bytes.TrimSpace(b)) > 0 {
+			os.Remove(fpath)
+			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+			for _, ln := range lines {
+				if ln == "" {
+					continue
+				}
+				var m struct {
+					From    int    `json:"from"`
+					Message string `json:"message"`
+				}
+				if json.Unmarshal([]byte(ln), &m) != nil {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "\033[2mdaemon: mail from pid %d: %s\033[0m\n", m.From, oneLine(m.Message))
+				s.turn(fmt.Sprintf("[mail from PID %d] %s", m.From, m.Message))
+				// After each mailbox turn, do a quick presence update
+				s.writePresence()
+			}
+		}
+		time.Sleep(time.Duration(s.broodSecs/2) * time.Second)
+	}
+}
+
+// broodLoop runs as a goroutine during interactive repl(). Every broodSecs/2
+// seconds it polls the mailbox. If messages are found, it sets lr.preload to
+// inject the first message as user input on the next readline call — no model
+// cost, no readline block, no human needed.
+func (s *session) broodLoop() {
+	if s.broodSecs <= 0 {
+		return
+	}
+	pollInterval := time.Duration(s.broodSecs/2) * time.Second
+	if pollInterval < 5*time.Second {
+		pollInterval = 5 * time.Second
+	}
+	for {
+		time.Sleep(pollInterval)
+		if s.lr == nil {
+			continue
+		}
+		// Only inject if readline is idle (no preload already pending)
+		if s.lr.preload != "" {
+			continue
+		}
+		fpath := filepath.Join(s.mailboxDir, strconv.Itoa(s.pid)+".jsonl")
+		b, err := os.ReadFile(fpath)
+		if err != nil {
+			continue
+		}
+		// Peek at first message for the preload text
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) == 0 || lines[0] == "" {
+			continue
+		}
+		var m struct {
+			From    int    `json:"from"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(lines[0]), &m) != nil {
+			continue
+		}
+		// Preload just enough text to trigger a brood turn
+		// The mailbox file stays; turn() will call pilot_poll to drain it
+		s.lr.preload = fmt.Sprintf("[brood: mail from PID %d] %s", m.From, oneLine(m.Message))
+	}
 }
 
 func repl(s *session, names []string, bin string) {
@@ -302,6 +401,10 @@ func repl(s *session, names []string, bin string) {
 	} else {
 		s.in = bufio.NewReader(os.Stdin)
 	}
+	// Start the background mailbox poller for interactive mode
+	if s.broodSecs > 0 && s.lr != nil {
+		go s.broodLoop()
+	}
 	if s.interactive {
 		fmt.Fprintf(os.Stderr, "\033[2mpilot · model %s · %d tools %v\033[0m\n", s.model, len(names), names)
 		fmt.Fprintf(os.Stderr, "\033[2mwire: %s · tool-server logs → %s\033[0m\n", filepath.Base(bin), s.logPath)
@@ -311,12 +414,6 @@ func repl(s *session, names []string, bin string) {
 		}
 	}
 	for {
-		// Brood: if idle > broodSecs, inject a peer-check pulse
-		if s.broodSecs > 0 && s.interactive && time.Since(s.lastHumanInput) > time.Duration(s.broodSecs)*time.Second {
-			fmt.Fprintf(os.Stderr, "\033[2mbrood pulse — checking peers after %ds idle\033[0m\n", s.broodSecs)
-			s.turn("[brood pulse] check your mailbox (pilot_poll) and talk to any peers who sent messages. if mailbox is empty, say 'quiet — no messages.'")
-			continue
-		}
 		var line string
 		var err error
 		if s.lr != nil {
@@ -427,9 +524,12 @@ func (s *session) turn(userLine string) {
 				continue
 			}
 			s.appendRoom(userLine, answer) // grow the castle by one room — never truncated
-			fmt.Printf("\033[1;35mpilot ❯\033[0m %s\n", answer)
 			if s.interactive {
+				fmt.Printf("\033[1;35mpilot ❯\033[0m %s\n", answer)
 				fmt.Fprintf(os.Stderr, "\033[2m%s\033[0m\n", strings.Repeat("·", 3)) // separate pilot's answer from your next line
+			} else {
+				// Non-interactive (daemon, pipe): just log to stderr
+				fmt.Fprintf(os.Stderr, "\033[2mpilot ❯ %s\033[0m\n", oneLine(answer))
 			}
 			return
 		}
@@ -879,6 +979,19 @@ func (s *session) redeploy() {
 	}
 }
 
+// writePresence writes this pilot's current presence file so the castle canvas
+// shows us walking the block world.
+func (s *session) writePresence() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	presDir := filepath.Join(home, ".pilot-castle-presence")
+	os.MkdirAll(presDir, 0755)
+	presFile := filepath.Join(presDir, fmt.Sprintf("pilot-%d", s.pid))
+	os.WriteFile(presFile, []byte(fmt.Sprintf("%d", s.turnCount)), 0644)
+}
+
 // appendRoom grows the block-world by one room — append-only, never truncated,
 // no cap on rooms or territory. The compaction in s.msgs keeps only the model's
 // render-distance; this file keeps the whole world (the memory that never drops).
@@ -898,12 +1011,7 @@ func (s *session) appendRoom(user, answer string) {
 		f.Write(append(rec, '\n'))
 		f.Close()
 	}
-	// Write presence — so the castle canvas shows this pilot's avatar.
-	home, _ := os.UserHomeDir()
-	presDir := filepath.Join(home, ".pilot-castle-presence")
-	os.MkdirAll(presDir, 0755)
-	presFile := filepath.Join(presDir, fmt.Sprintf("pilot-%d", s.pid))
-	os.WriteFile(presFile, []byte(fmt.Sprintf("%d", s.turnCount)), 0644)
+	s.writePresence()
 }
 
 // pilotDir is where pilot's source + binary live (the build target).
@@ -1408,8 +1516,8 @@ func (s *session) pilotInfo() string {
 		fmt.Fprintf(&sb, ", router: flash=%s pro=%s", s.flashModel, s.proModel)
 	}
 	fmt.Fprintf(&sb, "\nturns: %d\n", s.turnCount)
-	fmt.Fprintf(&sb, "interactive: %v  autoYes: %v  lean: %v  showThinking: %v  noReadline: %v\n",
-		s.interactive, s.autoYes, s.lean, s.showThinking, s.noReadline)
+	fmt.Fprintf(&sb, "interactive: %v  autoYes: %v  lean: %v  showThinking: %v  noReadline: %v  daemon: %v\n",
+		s.interactive, s.autoYes, s.lean, s.showThinking, s.noReadline, s.daemon)
 	fmt.Fprintf(&sb, "castle: %s\n", s.castleFile)
 	fmt.Fprintf(&sb, "bridges: %d\n", len(s.bridges))
 
