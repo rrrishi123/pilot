@@ -278,8 +278,17 @@ func termSize() (int, int) {
 }
 
 func main() {
+	serve := flag.String("serve", "", "serve the castle as a web page on this address (e.g. :9901)")
 	who := flag.String("who", "claude", "which of the two of us is walking: pilot | claude")
 	flag.Parse()
+	if *serve != "" {
+		path := os.ExpandEnv("$HOME/.pilot-castle.jsonl")
+		if a := flag.Args(); len(a) > 0 {
+			path = a[0]
+		}
+		runServe(*serve, path)
+		return
+	}
 	path := os.ExpandEnv("$HOME/.pilot-castle.jsonl")
 	if a := flag.Args(); len(a) > 0 {
 		path = a[0]
