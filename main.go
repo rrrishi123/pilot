@@ -290,6 +290,7 @@ type session struct {
 	interruptLine string // the line to preload when returning to the prompt
 	savedLine    string                     // the line being processed (for interrupt recovery)
 	cancel       context.CancelFunc         // cancel the in-flight API request on Ctrl+C
+	subCmd       *exec.Cmd                  // the running subprocess (for signal propagation)
 	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
 	msgs         []message         // grows across turns; the dialogue is the state
 	pid          int               // this pilot's process ID
@@ -389,6 +390,8 @@ func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
 	// Catch Ctrl+C during model thinking: cancel the API call,
 	// keep the user's input, and return to the prompt for editing.
+	// Also kill any running subprocess (run_command), process group
+	// and all — the old handler left orphans behind on every Ctrl+C.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT)
 	go func() {
@@ -397,6 +400,14 @@ func repl(s *session, names []string, bin string) {
 				s.interrupted = true
 				s.interruptLine = s.savedLine
 				s.cancel()
+			}
+			if s.subCmd != nil && s.subCmd.Process != nil {
+				// Send SIGINT to the process group (-pid) so the shell
+				// AND every grandchild dies together. No orphans.
+				syscall.Kill(-s.subCmd.Process.Pid, syscall.SIGINT)
+				// Give it a beat, then hard-kill anything still alive
+				time.Sleep(200 * time.Millisecond)
+				syscall.Kill(-s.subCmd.Process.Pid, syscall.SIGKILL)
 			}
 		}
 	}()
@@ -1477,7 +1488,22 @@ func (s *session) callBuiltin(name string, args map[string]any) (string, bool) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(secs)*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, "sh", "-c", cmdline).CombinedOutput()
+		cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)
+		// Setsid: the shell forms a new process group. On timeout/Ctrl+C
+		// we kill the whole group (shell + every grandchild), not just the
+		// shell. That stops castle -serve, daemon pilots, and http-mcp from
+		// surviving as orphans and wedging the next subprocess on pipe read.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		// Register so Ctrl+C can propagate — cleared on return
+		s.subCmd = cmd
+		defer func() { s.subCmd = nil }()
+		out, err := cmd.CombinedOutput()
+		if err != nil && ctx.Err() == context.DeadlineExceeded {
+			// The context killed cmd; kill the whole process group too
+			if cmd.Process != nil {
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		}
 		res := string(out)
 		if ctx.Err() == context.DeadlineExceeded {
 			res += fmt.Sprintf("\n[killed: exceeded %ds timeout]", secs)
