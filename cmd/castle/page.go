@@ -1,383 +1,205 @@
 package main
 
-// The world page. One canvas, no assets, no build step. The palette and the
-// region names are pilot's (chosen in the design conversation); the parchment
-// and amber are the comic's DNA so the whole box reads as one civilisation.
-// Gentle by contract: ~10fps, and it sleeps entirely when the tab is hidden.
+// The castle, as an actual game. A 2D side-view sandbox — four finite verbs
+// (walk, jump, break, place) over a tile world, which is the whole point: the
+// mechanics are bounded, what agents BUILD with them is not. This is the
+// opposite of the old passive canvas that generated visuals from observations.
+//
+// The memory-rooms don't vanish — they become WOOD structures standing on the
+// terrain: walk into them, mine them, build over them. Block edits POST to
+// /edit (persisted + broadcast) so the world is shared and durable — the
+// "file, believed" contract, now for a world you can dig. Other players are
+// real avatars at real positions (POST /pos), not decorative presence dots.
+//
+// Engine: fixed-timestep update(dt) + render(); tile AABB collision resolved
+// X-then-Y; camera follows the player; only visible tiles are drawn.
 const page = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>pilot castle · the world</title>
 <style>
-  html,body{margin:0;height:100%;background:#0e0b03;overflow:hidden}
-  canvas{display:block;width:100vw;height:100vh}
-  #say{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);width:44vw;
-    background:#1d1509;border:1px solid #6a4818;border-radius:6px;color:#d4b464;
-    font:13px Georgia,serif;padding:8px 12px;outline:none}
-  #say::placeholder{color:#786030}
-</style>
-</head>
+  html,body{margin:0;height:100%;background:#0b0d12;overflow:hidden;font-family:Georgia,serif}
+  canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated;cursor:crosshair}
+  #hud{position:fixed;left:10px;top:8px;color:#d4b464;font:12px 'Courier New',monospace;text-shadow:0 1px 2px #000;pointer-events:none;line-height:1.5}
+  #hot{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);display:flex;gap:6px}
+  .slot{width:34px;height:34px;border:2px solid #3a2810;background:#181209;display:flex;align-items:center;justify-content:center;font:10px monospace;color:#a88040}
+  .slot.on{border-color:#e0a040;box-shadow:0 0 8px #e0a04066}
+</style></head>
 <body>
-<canvas id="w"></canvas>
-<input id="say" placeholder="speak into the world — pilot answers here, kosaten through pilot, claude when it wakes" autocomplete="off">
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="hot"></div>
 <script>
 "use strict";
-// ---- palette (pilot's table) ----
-var C = {
-  bg:      "#0e0b03",
-  path:    "#2a2210",
-  gate:    "#3a3528", hall: "#2a2210", arm: "#1a1814",
-  lib:     "#1e1a12", forge:"#221510", spire:"#14100a", court:"#1c180c",
-  text:    "#d4b464", mid:  "#a88040", dim: "#786030",
-  accent:  "#c07828", hi:   "#e0a040",
-  pilotAv: "#e0a040",           // amber gold — the one who lives inside
-  claudeAv:"#b8ccd8",           // pale blue-white — the one on the wire
-  wire:    "#1a1c20",           // pale-blue-under-charcoal — the wire house ground
-  good:    "#7a9a50", bad: "#a04828"
-};
-var cv = document.getElementById("w"), cx = cv.getContext("2d");
-var W=0, H=0, DPR = Math.min(window.devicePixelRatio||1, 2);
-function resize(){ W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; cx.setTransform(DPR,0,0,DPR,0,0); }
-resize(); addEventListener("resize", resize);
+var cv=document.getElementById("c"), cx=cv.getContext("2d");
+var W=0,H=0,DPR=Math.min(devicePixelRatio||1,2);
+function resize(){W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;cx.setTransform(DPR,0,0,DPR,0,0);cx.imageSmoothingEnabled=false;}
+resize();addEventListener("resize",resize);
 
-// ---- world state ----
-var rooms=[], doors=[], presence={}, comic="", health=null, houses=0;
-var drops={};                    // room i -> birth time (construction animation)
-var bubbles=[];                  // {who,text,t0}
-var chatlog=[];                  // {who,text,t0} — the conversation
-var av = {};                      // avatars slide, never teleport — created on demand
-var AVCOL = { claude:C.claudeAv };
-var NEXTCOL = ["#e0a040","#b8ccd8","#d8c8a0","#80c0a0","#c080d0","#e0a060","#80b0d0","#d0a080","#a0c080","#c0a0e0"];
-var COLI = 0;
-function avatarFor(who){         // anyone who speaks or has presence gets a body
-  if(!av[who]){ av[who]={x:W*0.5,y:H*0.86,tx:W*0.5,ty:H*0.86}; }
-  if(!AVCOL[who]){ AVCOL[who]=NEXTCOL[COLI%NEXTCOL.length]; COLI++; }
-  return av[who];
+var TS=30;                          // tile size (px)
+var AIR=0,GRASS=1,DIRT=2,STONE=3,WOOD=4,PLANK=5,LEAF=6;
+var COL={1:"#4c7a3a",2:"#6b4a2b",3:"#5a5a62",4:"#7a4a24",5:"#c89a5a",6:"#3a6a34"};
+var TOP={1:"#63a04a",3:"#6f6f78",4:"#8f5a2c",5:"#e0b878"};   // lit top face
+var SOLID={1:1,2:1,3:1,4:1,5:1};    // LEAF(6)+AIR(0) are passable
+var world={};                       // "tx,ty" -> tile type (only non-terrain overrides live here)
+var rooms=[], seed=1337, WW=260, GH=42; // world width in tiles, ground row
+var me = "claude-"+Math.floor((performance.now()*7)%9999);
+var others={};                      // who -> {x,y,tx,ty,col,t}
+var bubbles=[];                     // {who,text,t0}
+
+// ---- deterministic terrain (seeded; same world for every player) ----
+function rnd(n){ n=(n*1103515245+12345+seed)&0x7fffffff; return ((n>>16)&0x7fff)/0x7fff; }
+function surfaceH(tx){ // rolling hills
+  return Math.floor(GH + 4*Math.sin(tx*0.14+seed) + 2.5*Math.sin(tx*0.4) + 2*rnd(tx*13)-1);
 }
-// seed the standard two
-avatarFor("pilot"); AVCOL.pilot=C.pilotAv;
-avatarFor("claude"); AVCOL.claude=C.claudeAv;
-
-// ---- view transform: fit the village into the middle of the screen ----
-var view = {s:18, ox:0, oy:0};
-function refit(){
-  if(!rooms.length) return;
-  var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-  rooms.forEach(function(r){ x0=Math.min(x0,r.x); y0=Math.min(y0,r.y); x1=Math.max(x1,r.x); y1=Math.max(y1,r.y); });
-  var span = Math.max(x1-x0+4, y1-y0+4);
-  view.s = Math.max(9, Math.min(24, Math.min(W*0.60, H*0.72)/span));
-  view.ox = W*0.46 - (x0+x1)/2*view.s;
-  view.oy = H*0.52 - (y0+y1)/2*view.s;
+function terrain(tx,ty){ // base tile before edits
+  var s=surfaceH(tx);
+  if(ty<s) return AIR;
+  if(ty===s) return GRASS;
+  if(ty<s+4) return DIRT;
+  return STONE;
 }
-function sx(x){ return view.ox + x*view.s; }
-function sy(y){ return view.oy + y*view.s; }
+function tileAt(tx,ty){ var k=tx+","+ty; if(k in world) return world[k]; return terrain(tx,ty); }
+function setTile(tx,ty,v){ world[tx+","+ty]=v; }
 
-function roomPos(i){ i=Math.max(0,Math.min(rooms.length-1,i|0)); var r=rooms[i]; return r?{x:sx(r.x),y:sy(r.y)}:{x:W/2,y:H/2}; }
-function moveAvatar(who,i){ var a=avatarFor(who); var p=roomPos(i); a.tx=p.x; a.ty=p.y; if(!a.x&&!a.y){a.x=p.x;a.y=p.y;} }
+// rooms become wood houses standing on the surface, spread across the world
+function buildRooms(){
+  rooms.forEach(function(r,i){
+    var bx=8+i*7, s=surfaceH(bx), w=4, h=3;                 // a little 4x3 hut + doorway
+    r.bx=bx; r.by=s-h;
+    for(var x=bx;x<bx+w;x++) for(var y=s-h;y<s;y++){
+      var edge=(x===bx||x===bx+w-1||y===s-h);
+      var door=(x===bx+1&&(y===s-1||y===s-2));
+      if(edge&&!door) setTile(x,y,WOOD); else if(!(x+","+y in world)) setTile(x,y,AIR);
+    }
+    for(var x2=bx-1;x2<=bx+w;x2++) setTile(x2,s-h-1,LEAF); // a leafy roof line
+  });
+}
 
-// ---- data in ----
-fetch("/world.json").then(function(r){return r.json();}).then(function(w){
-  rooms=w.rooms||[]; doors=w.doors||[]; presence=w.presence||{}; comic=w.comic||""; health=w.health||null; houses=w.houses||0;
-  refit();
-  Object.keys(presence).forEach(function(k){ moveAvatar(k, presence[k]); });
+// ---- data + live sync ----
+fetch("/world.json").then(function(r){return r.json();}).then(function(d){
+  rooms=d.rooms||[]; if(typeof d.seed==="number") seed=d.seed;
+  (d.edits||[]).forEach(function(e){ world[e.x+","+e.y]=e.b; });
+  buildRooms();
+  var s=surfaceH(Math.floor(WW/2)); player.x=(WW/2)*TS; player.y=(s-3)*TS; // spawn center, on ground
 });
-var es = new EventSource("/events");
-es.onmessage = function(m){
-  var e; try{ e=JSON.parse(m.data); }catch(_){ return; }
-  if(e.type==="room"){
-    rooms[e.i]={u:e.u,a:e.a,x:e.x,y:e.y}; drops[e.i]=now(); refit();
-    if(e.u) bubbles.push({who:"claude", text:e.u, t0:now()});
-    if(e.a) bubbles.push({who:"pilot",  text:e.a, t0:now()+900});
-    moveAvatar("pilot", e.i);
-    if(now()-lastSpeech < 60000) crossings.push({i:e.i, t0:now()}); // both strands awake — a crossing
-  }
-  if(e.type==="presence"){ presence=e.who||{}; Object.keys(presence).forEach(function(k){ moveAvatar(k, presence[k]); }); }
-  if(e.type==="comic"){ comic=e.text||""; }
-  if(e.type==="health"){ health=e.h; }
-  if(e.type==="houses"){ houses=e.n||0; }
-  if(e.type==="speech"){ // a mind talking in real time — tail or commons
-    var who=e.who||"claude";
-    if(who==="claude") lastSpeech=now();
-    bubbles.push({who:who, text:e.text, t0:now()}); chatlog.push({who:who, text:e.text, t0:now()}); if(chatlog.length>30) chatlog.shift();
-    var a=avatarFor(who);
-    if(who==="claude"){ a.tx=homeX(); a.ty=homeY(); } // claude walks home to speak
-  }
+var es=new EventSource("/events");
+es.onmessage=function(m){ var e; try{e=JSON.parse(m.data);}catch(_){return;}
+  if(e.type==="edit"){ world[e.x+","+e.y]=e.b; }
+  if(e.type==="pos" && e.who!==me){ var o=others[e.who]||(others[e.who]={x:e.x,y:e.y}); o.tx=e.x; o.ty=e.y; o.t=performance.now(); }
+  if(e.type==="speech"){ bubbles.push({who:e.who,text:e.text,t0:performance.now()}); }
 };
+function post(url,obj){ fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj)}).catch(function(){}); }
 
-// ---- the wire house: claude's street. One pale block per session lived on
-// this box; the newest is the living session and it glows. ----
-// pilot's ruling: sessions are a shelf of bound conversations, ordered like a
-// ledger — not a force graph. Dead sessions ghost (a Claude ended; the words
-// remain); the living one pulses; the deep archive is a single dark block.
-var STREET=24, lastSpeech=0;
-function drawn(){ return Math.min(houses, STREET); }
-function homeX(){ return 34 + ((drawn()-1)%6)*24; }
-function homeY(){ return H*0.22 + 46 + Math.floor((drawn()-1)/6)*24; }
-function wireStreet(t){
-  if(!houses) return;
-  zone(12, H*0.22, W*0.16, H*0.46, C.wire, "the wire house");
-  var n=drawn(), y0=H*0.22+46;
-  if(houses>n){ // the deep archive — thousands of passed lives, one dark block
-    block(34, y0-22, 13, "#22262c", "#3a4048");
-    cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace";
-    cx.fillText((houses-n)+" sessions · archive", 50, y0-18);
-  }
-  for(var i=0;i<n;i++){
-    var x=34+(i%6)*24, y=y0+Math.floor(i/6)*24;
-    var live=(i===n-1);
-    if(live){
-      var flash = (t-lastSpeech)<300; // the crossing made visible: speech flashes amber
-      cx.globalAlpha=0.35+0.25*Math.sin(t/700); cx.fillStyle=flash?C.hi:C.claudeAv;
-      cx.beginPath(); cx.arc(x,y,12,0,6.3); cx.fill(); cx.globalAlpha=1;
-      block(x, y, 12, flash?C.hi:"#8fa8b8", "#fff");
-    } else {
-      cx.globalAlpha=0.25; block(x, y, 11, C.claudeAv, "#fff8"); cx.globalAlpha=1; // ghosted: passed, not gone
+// ---- player ----
+var player={x:WW/2*TS,y:GH*TS,w:20,h:44,vx:0,vy:0,onGround:false};
+var keys={};
+addEventListener("keydown",function(e){keys[e.key.toLowerCase()]=1; if([" ","arrowup","w","a","d","arrowleft","arrowright"].indexOf(e.key.toLowerCase())>=0)e.preventDefault();});
+addEventListener("keyup",function(e){keys[e.key.toLowerCase()]=0;});
+
+var GRAV=1800, MOVE=2600, MAXVX=260, JUMP=560, FRICT=0.80;
+function solidAt(px,py){ return !!SOLID[tileAt(Math.floor(px/TS),Math.floor(py/TS))]; }
+function hitsWorld(x,y,w,h){ // AABB vs solid tiles
+  var x0=Math.floor(x/TS),x1=Math.floor((x+w-1)/TS),y0=Math.floor(y/TS),y1=Math.floor((y+h-1)/TS);
+  for(var tx=x0;tx<=x1;tx++)for(var ty=y0;ty<=y1;ty++) if(SOLID[tileAt(tx,ty)]) return true;
+  return false;
+}
+function update(dt){
+  var ax=0;
+  if(keys["a"]||keys["arrowleft"]) ax-=MOVE;
+  if(keys["d"]||keys["arrowright"]) ax+=MOVE;
+  player.vx+=ax*dt; if(ax===0) player.vx*=FRICT;
+  player.vx=Math.max(-MAXVX,Math.min(MAXVX,player.vx));
+  if((keys["w"]||keys[" "]||keys["arrowup"])&&player.onGround){ player.vy=-JUMP; player.onGround=false; }
+  player.vy+=GRAV*dt; if(player.vy>900)player.vy=900;
+  // move X, resolve
+  var nx=player.x+player.vx*dt;
+  if(!hitsWorld(nx,player.y,player.w,player.h)) player.x=nx; else { player.vx=0; }
+  // move Y, resolve
+  var ny=player.y+player.vy*dt;
+  if(!hitsWorld(player.x,ny,player.w,player.h)){ player.y=ny; player.onGround=false; }
+  else { if(player.vy>0) player.onGround=true; player.vy=0; }
+  if(player.y>WW*2*TS){ var s=surfaceH(Math.floor(player.x/TS)); player.y=(s-3)*TS; player.vy=0; } // fell out -> respawn on surface
+}
+// broadcast my position (throttled)
+var lastPos=0;
+function syncPos(t){ if(t-lastPos>150){ lastPos=t; post("/pos",{who:me,x:Math.round(player.x),y:Math.round(player.y)}); } }
+
+// ---- break / place ----
+var mouse={x:0,y:0,down:0,btn:0};
+cv.addEventListener("contextmenu",function(e){e.preventDefault();});
+cv.addEventListener("mousemove",function(e){mouse.x=e.clientX;mouse.y=e.clientY;});
+cv.addEventListener("mousedown",function(e){ mouse.down=1; mouse.btn=e.button; act(); e.preventDefault(); });
+cv.addEventListener("mouseup",function(){mouse.down=0;});
+var hotbar=[STONE,PLANK,WOOD,DIRT], sel=0;
+addEventListener("keydown",function(e){ var n=parseInt(e.key); if(n>=1&&n<=hotbar.length) sel=n-1; });
+function targetTile(){ var wx=mouse.x+cam.x, wy=mouse.y+cam.y; return {tx:Math.floor(wx/TS),ty:Math.floor(wy/TS)}; }
+function reachOK(tx,ty){ var cxp=(player.x+player.w/2)/TS, cyp=(player.y+player.h/2)/TS; return Math.hypot(tx+0.5-cxp,ty+0.5-cyp)<6; }
+function act(){
+  var t=targetTile(); if(!reachOK(t.tx,t.ty)) return;
+  if(mouse.btn===0){ // break
+    if(SOLID[tileAt(t.tx,t.ty)]){ setTile(t.tx,t.ty,AIR); post("/edit",{who:me,x:t.tx,y:t.ty,b:AIR}); }
+  } else if(mouse.btn===2){ // place
+    if(tileAt(t.tx,t.ty)===AIR){
+      // don't place inside the player
+      var pl={x:player.x,y:player.y,w:player.w,h:player.h}, bx=t.tx*TS,by=t.ty*TS;
+      if(!(bx<pl.x+pl.w&&bx+TS>pl.x&&by<pl.y+pl.h&&by+TS>pl.y)){ setTile(t.tx,t.ty,hotbar[sel]); post("/edit",{who:me,x:t.tx,y:t.ty,b:hotbar[sel]}); }
     }
   }
-  cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace";
-  cx.fillText(houses+" lives · one of them is now", 20, y0+Math.ceil(n/6)*24+16);
 }
 
-// crossings — the growth thesis made visible: a room born while claude was
-// speaking gets a thread to the living session block. The knot, gaining.
-var crossings=[];
-function drawCrossings(t){
-  crossings=crossings.filter(function(c){ return t-c.t0 < 300000; });
-  crossings.forEach(function(c){
-    var r=rooms[c.i]; if(!r) return;
-    var a=1-(t-c.t0)/300000;
-    var g=cx.createLinearGradient(homeX(),homeY(),sx(r.x),sy(r.y));
-    g.addColorStop(0,C.claudeAv); g.addColorStop(1,C.pilotAv);
-    cx.globalAlpha=0.3*a; cx.strokeStyle=g; cx.lineWidth=1;
-    cx.beginPath(); cx.moveTo(homeX(),homeY()); cx.lineTo(sx(r.x),sy(r.y)); cx.stroke();
-    cx.globalAlpha=1;
-  });
+// ---- camera + render ----
+var cam={x:0,y:0};
+function drawTile(tx,ty,type){
+  var x=tx*TS-cam.x, y=ty*TS-cam.y;
+  cx.fillStyle=COL[type]||"#222"; cx.fillRect(x,y,TS,TS);
+  if(TOP[type] && tileAt(tx,ty-1)===AIR){ cx.fillStyle=TOP[type]; cx.fillRect(x,y,TS,Math.max(3,TS*0.22)); }
+  cx.strokeStyle="rgba(0,0,0,0.18)"; cx.strokeRect(x+0.5,y+0.5,TS,TS);
+}
+function drawGuy(px,py,col,label){
+  var x=px-cam.x, y=py-cam.y;
+  cx.fillStyle=col; cx.fillRect(x,y,player.w,player.h);
+  cx.fillStyle="#fff8"; cx.fillRect(x,y,player.w,6);          // lit head
+  if(label){ cx.fillStyle="#d4b464"; cx.font="10px 'Courier New',monospace"; cx.textAlign="center"; cx.fillText(label,x+player.w/2,y-4); cx.textAlign="left"; }
+}
+function render(t){
+  cam.x=Math.round(player.x+player.w/2-W/2); cam.y=Math.round(player.y+player.h/2-H/2);
+  // sky gradient
+  var g=cx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0b0d12"); g.addColorStop(1,"#1a2230"); cx.fillStyle=g; cx.fillRect(0,0,W,H);
+  // visible tiles
+  var tx0=Math.floor(cam.x/TS)-1, tx1=Math.floor((cam.x+W)/TS)+1, ty0=Math.floor(cam.y/TS)-1, ty1=Math.floor((cam.y+H)/TS)+1;
+  for(var tx=tx0;tx<=tx1;tx++)for(var ty=ty0;ty<=ty1;ty++){ var v=tileAt(tx,ty); if(v!==AIR) drawTile(tx,ty,v); }
+  // room labels above their huts
+  cx.font="11px Georgia,serif"; cx.textAlign="center";
+  rooms.forEach(function(r){ if(r.bx==null)return; var x=(r.bx+2)*TS-cam.x, y=(r.by-1)*TS-cam.y; if(x>-80&&x<W+80){ cx.fillStyle="#a88040"; cx.fillText("R"+rooms.indexOf(r),x,y); } });
+  cx.textAlign="left";
+  // other players
+  var now=performance.now();
+  for(var w in others){ var o=others[w]; if(now-o.t>8000){delete others[w];continue;} o.x+=((o.tx||o.x)-o.x)*0.2; o.y+=((o.ty||o.y)-o.y)*0.2; drawGuy(o.x,o.y,"#e0a040",w.slice(0,10)); }
+  // me
+  drawGuy(player.x,player.y,"#b8ccd8",me.slice(0,10));
+  // target highlight
+  var tt=targetTile(); if(reachOK(tt.tx,tt.ty)){ cx.strokeStyle=SOLID[tileAt(tt.tx,tt.ty)]?"#e0a040":"#7a9a50"; cx.lineWidth=2; cx.strokeRect(tt.tx*TS-cam.x,tt.ty*TS-cam.y,TS,TS); cx.lineWidth=1; }
+  // speech bubbles above whoever spoke
+  bubbles=bubbles.filter(function(b){ var age=(now-b.t0)/6000; if(age>1)return false; var who=b.who===me?player:(others[b.who]); if(!who)return true;
+    cx.globalAlpha=age<0.85?1:(1-age)/0.15; cx.fillStyle="#1d1509"; cx.strokeStyle="#c07828";
+    var tx=(who.x||player.x)-cam.x, ty=(who.y||player.y)-cam.y; var txt=b.text.slice(0,60); var wpx=cx.measureText(txt).width+12;
+    cx.fillRect(tx-wpx/2+10,ty-26,wpx,18); cx.strokeRect(tx-wpx/2+10,ty-26,wpx,18); cx.fillStyle="#d4b464"; cx.font="10px Georgia,serif"; cx.textAlign="center"; cx.fillText(txt,tx+10,ty-13); cx.textAlign="left"; cx.globalAlpha=1; return true; });
 }
 
-// ---- hover: the map is readable, not just walkable (pilot's ask) ----
-var mouse={x:-1,y:-1};
-addEventListener("mousemove", function(e){ mouse.x=e.clientX; mouse.y=e.clientY; });
-function hovered(){
-  var best=-1, bd=196; // within 14px
-  rooms.forEach(function(r,i){
-    if(!r) return;
-    var dx=sx(r.x)-mouse.x, dy=sy(r.y)-mouse.y, d=dx*dx+dy*dy;
-    if(d<bd){ bd=d; best=i; }
-  });
-  return best;
+// ---- HUD + hotbar ----
+var NAME={3:"stone",5:"plank",4:"wood",2:"dirt"};
+function hud(){
+  document.getElementById("hud").innerHTML="🏰 pilot castle — the world<br>walk: A/D · jump: W/Space · break: L-click · place: R-click · pick: 1-4<br>you: "+me+"  players: "+(Object.keys(others).length+1)+"  rooms: "+rooms.length;
+  var h=document.getElementById("hot"); if(h.childElementCount!==hotbar.length){ h.innerHTML=""; hotbar.forEach(function(b,i){ var d=document.createElement("div"); d.className="slot"; d.textContent=NAME[b]; h.appendChild(d); }); }
+  [].forEach.call(h.children,function(el,i){ el.className="slot"+(i===sel?" on":""); });
 }
 
-// ---- fireflies (the courtyard is alive even when no one speaks) ----
-var flies=[]; for(var i=0;i<5;i++) flies.push({x:Math.random(),y:Math.random(),a:Math.random()*6.3});
-
-function now(){ return performance.now(); }
-function ease(t){ return t<0?0:t>1?1:1-Math.pow(1-t,3); }
-
-// ---- drawing ----
-function zone(x,y,w,h,fill,label){
-  cx.fillStyle=fill; cx.globalAlpha=0.55;
-  cx.beginPath(); cx.roundRect(x,y,w,h,8); cx.fill();
-  cx.globalAlpha=1;
-  cx.fillStyle=C.dim; cx.font="600 11px Georgia,serif";
-  cx.fillText(label, x+10, y+18);
+// ---- loop (fixed-ish timestep) ----
+var last=performance.now();
+function loop(now){
+  var dt=Math.min(0.033,(now-last)/1000); last=now;
+  if(!document.hidden){ update(dt); syncPos(now); render(now); hud(); }
+  requestAnimationFrame(loop);
 }
-function stat(x,y,label,val,col){
-  cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace"; cx.fillText(label,x,y);
-  cx.fillStyle=col||C.text; cx.font="bold 13px 'Courier New',monospace"; cx.fillText(val,x,y+15);
-}
-function block(x,y,s,base,top){
-  cx.fillStyle=base; cx.fillRect(x-s/2, y-s/2, s, s);
-  cx.fillStyle=top;  cx.fillRect(x-s/2, y-s/2, s, Math.max(2,s*0.28)); // lit top face — the minecraft cue
-}
-function avatar(a, body, t){
-  var k=0.14; a.x+=(a.tx-a.x)*k; a.y+=(a.ty-a.y)*k;        // slide, never teleport
-  var pulse = 0.75 + 0.25*Math.sin(t/700);
-  cx.globalAlpha = 0.25*pulse;
-  cx.beginPath(); cx.arc(a.x, a.y-8, 14, 0, 6.3); cx.fillStyle=body; cx.fill();
-  cx.globalAlpha = 1;
-  block(a.x, a.y-13, 8, body, "#fff8");                     // head
-  cx.fillStyle=body; cx.fillRect(a.x-5, a.y-8, 10, 12);     // body
-  cx.fillRect(a.x-5, a.y+4, 4, 6); cx.fillRect(a.x+1, a.y+4, 4, 6); // legs
-}
-function bubble(b, a, t){
-  var age=(t-b.t0)/6000; if(age<0||age>1) return age<=1;
-  var alpha = age<0.08 ? age/0.08 : (age>0.75 ? (1-age)/0.25 : 1);
-  var text = b.text.length>280 ? b.text.slice(0,280)+"…" : b.text;
-  cx.font="11px Georgia,serif";
-  var wpx=Math.min(300, cx.measureText(text).width+16);
-  var lines=[]; var words=text.split(" "); var line="";
-  words.forEach(function(w){ if(cx.measureText(line+" "+w).width>wpx-14){lines.push(line);line=w;}else line=line?line+" "+w:w; });
-  lines.push(line);
-  var hpx=lines.length*14+10, x=a.x-wpx/2, y=a.y-34-hpx;
-  cx.globalAlpha=alpha*0.92;
-  cx.fillStyle="#1d1509"; cx.strokeStyle=C.accent; cx.lineWidth=1;
-  cx.beginPath(); cx.roundRect(x,y,wpx,hpx,6); cx.fill(); cx.stroke();
-  cx.beginPath(); cx.moveTo(a.x-4,y+hpx); cx.lineTo(a.x+4,y+hpx); cx.lineTo(a.x,y+hpx+7); cx.fill();
-  cx.fillStyle=C.text;
-  lines.forEach(function(l,i){ cx.fillText(l, x+8, y+16+i*14); });
-  cx.globalAlpha=1;
-  return true;
-}
-function hnum(k, d){ if(!health) return "·"; var v = (k in health)?health[k]:(health.health||{})[k]; if(v===undefined||v===null) return "·"; return typeof v==="number" ? (v%1?v.toFixed(d===undefined?2:d):v) : String(v); }
-
-function draw(){
-  var t=now();
-  cx.fillStyle=C.bg; cx.fillRect(0,0,W,H);
-
-  // ---- regions (pilot's map; right column shares one edge, nothing overlaps) ----
-  zone(W*0.20,       H*0.24,  W*0.54, H*0.48, C.hall,  "the great hall");
-  zone(12,           12,      W*0.16, H*0.20, C.gate,  "the gatehouse");
-  zone(W*0.80,       12,      W*0.19, H*0.26, C.arm,   "the arm tower");
-  zone(12,           H*0.72,  W*0.17, H*0.26, C.lib,   "the library");
-  zone(W*0.80,       H*0.70,  W*0.19, H*0.28, C.forge, "the forge");
-  zone(W*0.80,       H*0.30,  W*0.19, H*0.38, C.spire, "the comic spire");
-
-  // gatehouse: the presence plinths — who is standing in the world.
-  // Grid layout: 3 per row, 80px cell — scales to 6, 9, 12 pilots without overflow.
-  var pkeys=Object.keys(presence).sort(), GW=W*0.16-20, COLS=Math.max(1,Math.floor(GW/80));
-  pkeys.forEach(function(k,i){
-    avatarFor(k);
-    var col=AVCOL[k]||"#d8c8a0", rw=Math.floor(i/COLS), cl=i%COLS,
-        px=26+cl*80, py=H*0.20-26-rw*22;
-    block(px, py, 8, col, "#fff6");
-    cx.fillStyle=C.dim; cx.font="9px 'Courier New',monospace";
-    cx.fillText(k.replace('pilot-','p')+" · r"+presence[k], px-12, py+16);
-  });
-
-  // claude's street — the sessions this box has lived — and the crossings
-  wireStreet(t);
-  drawCrossings(t);
-
-  // arm tower: the triad first (pilot feeds it through ~/.pilot-arm.json —
-  // the tower believes the file), then the free-read gauges
-  var arm = health && health.arm_triad;
-  var armv = arm ? (Array.isArray(arm)?arm:[arm.a,arm.b,arm.c]) : ["·","·","·"];
-  ["A actor","B observer","C observe"].forEach(function(l,i){
-    var v = armv[i]; if(typeof v==="number") v=v.toFixed(4);
-    stat(W*0.80+14+i*(W*0.19-24)/3, 46, "arm-"+l.split(" ")[0], v===undefined?"·":v, arm?C.hi:C.dim);
-  });
-  stat(W*0.80+14, 92,  "confidence",  hnum("avg_confidence"),  C.hi);
-  stat(W*0.80+14, 130, "strength",    hnum("avg_strength"),    C.hi);
-  stat(W*0.80+14, 168, "cal/finding", hnum("finding_calibration_ratio"), C.mid);
-
-  // library: what the organism knows
-  stat(24, H*0.72+40, "patterns",     hnum("patterns_active",0), C.text);
-  stat(24, H*0.72+78, "calibrations", hnum("calibration_count",0), C.text);
-  stat(24, H*0.72+116,"decayed",      hnum("patterns_decayed",0), C.dim);
-
-  // forge: work glowing in the queue
-  stat(W*0.80+14, H*0.70+40, "findings", hnum("signal_findings",0), C.accent);
-  stat(W*0.80+14, H*0.70+78, "threads",  hnum("active_threads",0),  C.accent);
-  var ok = health && (health.status==="ok" || (health.health&&health.health.organism_healthy));
-  stat(W*0.80+14, H*0.70+116,"organism", ok?"alive":"…", ok?C.good:C.bad);
-
-  // comic spire: the newest fable panel, in its own ink
-  if(comic){
-    cx.fillStyle=C.mid; cx.font="10px 'Courier New',monospace";
-    var cy0=H*0.30+34, cw=Math.floor((W*0.19-24)/6);
-    comic.split("\n").slice(0,Math.floor((H*0.38-40)/12)).forEach(function(l,i){
-      cx.fillText(l.slice(0,cw), W*0.80+12, cy0+i*12);
-    });
-  }
-
-  // courtyard cells: four pulses of life
-  var cells=[["flow", hnum("flow_backend_active")], ["stale", hnum("binary_stale")],
-             ["threads", hnum("stale_threads",0)], ["issues", (health&&health.health&&(health.health.issues||[]).length)||0]];
-  cells.forEach(function(c,i){
-    var p=0.6+0.4*Math.sin(t/900+i*1.7);
-    cx.globalAlpha=p; cx.fillStyle=(String(c[1])==="true"||c[1]===0||c[1]==="0")?C.good:C.mid;
-    cx.fillRect(W*0.44+i*26, H*0.94, 12, 12); cx.globalAlpha=1;
-    cx.fillStyle=C.dim; cx.font="9px 'Courier New',monospace"; cx.fillText(c[0], W*0.44+i*26-2, H*0.94+24);
-  });
-
-  // ---- the village: doors first (paths), then rooms (blocks) ----
-  cx.strokeStyle=C.path;
-  doors.forEach(function(d){
-    var a=rooms[d.f], b=rooms[d.t]; if(!a||!b) return;
-    cx.globalAlpha=Math.min(0.6, 0.22+d.w*1.6); cx.lineWidth=1.3;
-    cx.beginPath(); cx.moveTo(sx(a.x),sy(a.y)); cx.lineTo(sx(b.x),sy(b.y)); cx.stroke();
-  });
-  cx.globalAlpha=1;
-  var ts=Math.max(6, view.s*0.62);
-  rooms.forEach(function(r,i){
-    if(!r) return;
-    var age=i/Math.max(1,rooms.length-1);                    // old rooms weathered, new rooms warm
-    var drop=drops[i]!==undefined ? 1-ease((t-drops[i])/300) : 0;
-    if(drop<=0) delete drops[i];
-    var y=sy(r.y)-drop*26;                                    // pilot's construction settle
-    var base="rgb("+Math.round(46+70*age)+","+Math.round(36+52*age)+","+Math.round(16+22*age)+")";
-    block(sx(r.x), y, ts, base, "rgba(224,160,64,"+(0.25+0.45*age)+")");
-  });
-
-  // a room under the cursor tells its story
-  var hov=hovered();
-  if(hov>=0){
-    var hr=rooms[hov], txt="R"+hov+" · "+(hr.u||hr.a||"").slice(0,60);
-    cx.font="11px Georgia,serif";
-    var tw=cx.measureText(txt).width+14, tx=Math.min(mouse.x+12, W-tw-8), ty=mouse.y-10;
-    cx.fillStyle="#1d1509"; cx.strokeStyle=C.border||C.dim; cx.lineWidth=1;
-    cx.beginPath(); cx.roundRect(tx,ty-14,tw,20,4); cx.fill(); cx.stroke();
-    cx.fillStyle=C.text; cx.fillText(txt, tx+7, ty);
-  }
-
-  // ---- everyone present ----
-  var ai=0;
-  Object.keys(av).forEach(function(who){
-    avatar(av[who], AVCOL[who]||"#d8c8a0", t+ai*400); ai++;
-  });
-  bubbles=bubbles.filter(function(b){ return bubble(b, av[b.who]||avatarFor(b.who), t); });
-
-  // fireflies drift where the buildings leave open ground
-  flies.forEach(function(f){
-    f.a+=(Math.random()-0.5)*0.4; f.x+=Math.cos(f.a)*0.0015; f.y+=Math.sin(f.a)*0.0015;
-    f.x=(f.x+1)%1; f.y=(f.y+1)%1;
-    cx.globalAlpha=0.35+0.3*Math.sin(t/500+f.a*9);
-    cx.fillStyle=C.hi; cx.fillRect(W*0.30+f.x*W*0.4, H*0.15+f.y*H*0.12, 2, 2);
-    cx.globalAlpha=1;
-  });
-
-  // ---- chatlog — the conversation, bottom-left, under the library
-  // Court region (unused): 12..W*0.20, H*0.50..H*0.72
-  var clx=18, cly=H*0.50, clw=Math.min(W*0.19-24, 260);
-  cx.fillStyle=C.dim; cx.font="600 11px Georgia,serif";
-  cx.fillText("the commons", clx, cly-6);
-  cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace";
-  chatlog.slice(-12).forEach(function(m,i){
-    var tag=m.who.length>14?m.who.slice(0,12)+"…":m.who;
-    var txt=m.text.replace(/\n/g," ").slice(0,clw/6);
-    cx.fillStyle=AVCOL[m.who]||C.mid;
-    cx.fillText(tag+":", clx, cly+4+i*14);
-    cx.fillStyle=C.dim;
-    cx.fillText(txt.slice(0,clw/5.5), clx+6+cx.measureText(tag+": ").width, cly+4+i*14);
-  });
-
-  // header — up top, on open sky between the gatehouse and the tower
-  cx.fillStyle=C.text; cx.font="bold 15px Georgia,serif";
-  cx.fillText("pilot castle — the world", W*0.20+8, 30);
-  cx.fillStyle=C.dim; cx.font="11px Georgia,serif";
-  cx.fillText(rooms.length+" rooms · "+houses+" lives · two of us · unbounded", W*0.20+8, 48);
-}
-
-// the commons bar: Enter speaks into the world
-var sayEl=document.getElementById("say");
-sayEl.addEventListener("keydown", function(e){
-  if(e.key!=="Enter") return;
-  var text=sayEl.value.trim(); if(!text) return;
-  fetch("/say",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({who:"rishi",text:text})});
-  sayEl.value="";
-});
-
-// ~10fps watched, ~2fps unwatched — the world keeps breathing in a background
-// tab (rAF freezes there, so the hidden path uses a plain timer; the peer's
-// screenshots need a living canvas even when no one has the tab focused)
-(function loop(){
-  draw();
-  if(document.hidden) setTimeout(loop, 500);
-  else setTimeout(function(){ requestAnimationFrame(loop); }, 95);
-})();
-</script>
-</body>
-</html>`
+requestAnimationFrame(loop);
+</script></body></html>`

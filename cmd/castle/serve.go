@@ -55,6 +55,11 @@ type world struct {
 	health   map[string]any
 	houses   int // claude's sessions — one house each on the wire street
 	subs     map[chan string]bool
+	// the game: block edits (break/place) persisted so builds last & are shared;
+	// seed makes the terrain deterministic (same world for every player).
+	edits     []map[string]any
+	editsPath string
+	seed      int64
 }
 
 func clip(s string, n int) string {
@@ -427,6 +432,7 @@ func (w *world) worldJSON() []byte {
 	b, _ := json.Marshal(map[string]any{
 		"rooms": rooms, "doors": doors, "presence": w.presence,
 		"comic": w.comic, "health": w.health, "houses": w.houses,
+		"seed": w.seed, "edits": w.edits, // the game: deterministic terrain + persisted block edits
 	})
 	return b
 }
@@ -436,9 +442,23 @@ func runServe(addr, path string) {
 	doors := buildDoors(rooms)
 	w := &world{
 		path: path, rooms: rooms, doors: doors,
-		pos:      fullLayout(rooms, doors),
-		presence: readPresence(),
-		subs:     map[chan string]bool{},
+		pos:       fullLayout(rooms, doors),
+		presence:  readPresence(),
+		subs:      map[chan string]bool{},
+		editsPath: os.ExpandEnv("$HOME/.pilot-castle-edits.jsonl"),
+		seed:      1337, // the world's terrain seed — shared by every player
+	}
+	// replay persisted block edits so the built world survives restarts
+	if f, err := os.Open(w.editsPath); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 1<<20), 1<<22)
+		for sc.Scan() {
+			var e map[string]any
+			if json.Unmarshal(sc.Bytes(), &e) == nil {
+				w.edits = append(w.edits, e)
+			}
+		}
+		f.Close()
 	}
 	go w.watchRooms()
 	go w.watchPresence()
@@ -453,6 +473,54 @@ func runServe(addr, path string) {
 	http.HandleFunc("/world.json", func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write(w.worldJSON())
+	})
+	// /edit — break or place a block. Persisted (append-only jsonl, the "file,
+	// believed" contract for a world you can dig) and broadcast so every player
+	// sees the change live. b is the block type (0=air=break, else place).
+	http.HandleFunc("/edit", func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(rw, "POST only", 405)
+			return
+		}
+		var e struct {
+			Who string `json:"who"`
+			X   int    `json:"x"`
+			Y   int    `json:"y"`
+			B   int    `json:"b"`
+		}
+		if json.NewDecoder(r.Body).Decode(&e) != nil {
+			http.Error(rw, "bad edit", 400)
+			return
+		}
+		rec := map[string]any{"x": e.X, "y": e.Y, "b": e.B}
+		w.mu.Lock()
+		w.edits = append(w.edits, rec)
+		w.mu.Unlock()
+		if f, err := os.OpenFile(w.editsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			json.NewEncoder(f).Encode(rec)
+			f.Close()
+		}
+		w.broadcast(map[string]any{"type": "edit", "x": e.X, "y": e.Y, "b": e.B})
+		rw.WriteHeader(204)
+	})
+	// /pos — a player's live position. Ephemeral (not persisted); broadcast so
+	// other players see real avatars moving, not decorative presence dots.
+	http.HandleFunc("/pos", func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(rw, "POST only", 405)
+			return
+		}
+		var p struct {
+			Who string `json:"who"`
+			X   int    `json:"x"`
+			Y   int    `json:"y"`
+		}
+		if json.NewDecoder(r.Body).Decode(&p) != nil || p.Who == "" {
+			http.Error(rw, "bad pos", 400)
+			return
+		}
+		w.broadcast(map[string]any{"type": "pos", "who": p.Who, "x": p.X, "y": p.Y})
+		rw.WriteHeader(204)
 	})
 	// /say — the commons. The world is a REPL between the minds on this box:
 	// a line spoken here is appended to ~/.pilot-commons.jsonl (a file,
