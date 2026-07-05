@@ -60,27 +60,6 @@ type world struct {
 	edits     []map[string]any
 	editsPath string
 	seed      int64
-	// civilisation: agent homes + work zones + live positions
-	homes     map[string]map[string]int
-	homesPath string
-	agentPos  map[string]agentPos
-	zones     []zoneDef
-}
-
-type agentPos struct {
-	Who string `json:"who"`
-	X   int    `json:"x"`
-	Y   int    `json:"y"`
-	At  int64  `json:"at"`
-}
-
-type zoneDef struct {
-	Name string `json:"name"`
-	TX   int    `json:"tx"`
-	TY   int    `json:"ty"`
-	W    int    `json:"w"`
-	H    int    `json:"h"`
-	Icon string `json:"icon"`
 }
 
 func clip(s string, n int) string {
@@ -195,33 +174,6 @@ func placeNew(p []xy, i int, ds []door) xy {
 	q := append(append([]xy{}, p...), xy{p[anchor].X + 1, p[anchor].Y})
 	snap(q, len(p))
 	return q[len(p)]
-}
-
-// seededHome — each agent gets a deterministic spawn territory from their name.
-func seededHome(name string, seed int64) (int, int) {
-	h := int64(0)
-	for _, c := range name {
-		h = h*31 + int64(c)
-	}
-	r := h ^ (seed * 7)
-	tx := int((r % 200) - 100 + (r/7)%100)
-	ty := -8
-	if ty > -3 {
-		ty = -3
-	}
-	return tx, ty
-}
-
-// defaultZoneDefs — the civilisation's work zones. Each has a tile origin + size.
-func defaultZoneDefs() []zoneDef {
-	return []zoneDef{
-		{Name: "forge", TX: 80, TY: -12, W: 12, H: 8, Icon: "🔨"},
-		{Name: "library", TX: -60, TY: -12, W: 14, H: 8, Icon: "📚"},
-		{Name: "gatehouse", TX: -5, TY: -12, W: 10, H: 8, Icon: "🏛"},
-		{Name: "arm-tower", TX: 60, TY: -12, W: 8, H: 8, Icon: "🗼"},
-		{Name: "commons", TX: -30, TY: -12, W: 10, H: 8, Icon: "💬"},
-		{Name: "spire", TX: 100, TY: -12, W: 8, H: 8, Icon: "🔮"},
-	}
 }
 
 func (w *world) broadcast(v any) {
@@ -480,8 +432,7 @@ func (w *world) worldJSON() []byte {
 	b, _ := json.Marshal(map[string]any{
 		"rooms": rooms, "doors": doors, "presence": w.presence,
 		"comic": w.comic, "health": w.health, "houses": w.houses,
-		"seed": w.seed, "edits": w.edits,
-		"homes": w.homes, "zones": w.zones, "agentPos": w.agentPos,
+		"seed": w.seed, "edits": w.edits, // the game: deterministic terrain + persisted block edits
 	})
 	return b
 }
@@ -495,32 +446,7 @@ func runServe(addr, path string) {
 		presence:  readPresence(),
 		subs:      map[chan string]bool{},
 		editsPath: os.ExpandEnv("$HOME/.pilot-castle-edits.jsonl"),
-		seed:      1337,
-			homesPath: os.ExpandEnv("$HOME/.pilot-homes.json"),
-			agentPos:  map[string]agentPos{},
-			zones:     defaultZoneDefs(),
-		}
-	// load or seed homes
-	if f, err := os.Open(w.homesPath); err == nil {
-		json.NewDecoder(f).Decode(&w.homes)
-		f.Close()
-	}
-	if w.homes == nil {
-		w.homes = map[string]map[string]int{}
-	}
-	// seed homes for known presence names if not yet set
-	for name := range readPresence() {
-		if _, ok := w.homes[name]; !ok {
-			tx, ty := seededHome(name, w.seed)
-			w.homes[name] = map[string]int{"tx": tx, "ty": ty}
-		}
-	}
-	// always seed the canonical agents
-	for _, name := range []string{"pilot", "claude", "fable-pilot", "rishi"} {
-		if _, ok := w.homes[name]; !ok {
-			tx, ty := seededHome(name, w.seed)
-			w.homes[name] = map[string]int{"tx": tx, "ty": ty}
-		}
+		seed:      1337, // the world's terrain seed — shared by every player
 	}
 	// replay persisted block edits so the built world survives restarts
 	if f, err := os.Open(w.editsPath); err == nil {
@@ -594,59 +520,7 @@ func runServe(addr, path string) {
 			return
 		}
 		w.broadcast(map[string]any{"type": "pos", "who": p.Who, "x": p.X, "y": p.Y})
-		w.mu.Lock()
-		w.agentPos[p.Who] = agentPos{Who: p.Who, X: p.X, Y: p.Y, At: time.Now().UnixMilli()}
-		w.mu.Unlock()
 		rw.WriteHeader(204)
-	})
-	http.HandleFunc("/homes", func(rw http.ResponseWriter, r *http.Request) {
-		w.mu.Lock()
-		h := w.homes
-		w.mu.Unlock()
-		b, _ := json.Marshal(h)
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Write(b)
-	})
-	http.HandleFunc("/locate", func(rw http.ResponseWriter, r *http.Request) {
-		who := r.URL.Query().Get("who")
-		if who == "" {
-			http.Error(rw, "?who= required", 400)
-			return
-		}
-		w.mu.Lock()
-		home := w.homes[who]
-		pos := w.agentPos[who]
-		w.mu.Unlock()
-		out := map[string]any{"name": who}
-		if home != nil {
-			out["home"] = home
-		}
-		if pos.At > 0 {
-			out["position"] = map[string]int{"x": pos.X, "y": pos.Y}
-			out["lastSeen"] = pos.At
-		}
-		px := pos.X / 30
-		py := pos.Y / 30
-		for _, z := range w.zones {
-			if px >= z.TX && px < z.TX+z.W && py >= z.TY && py < z.TY+z.H {
-				out["zone"] = z.Name
-				break
-			}
-		}
-		if out["zone"] == nil && home != nil {
-			out["zone"] = "home"
-		}
-		b, _ := json.Marshal(out)
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Write(b)
-	})
-	http.HandleFunc("/zones", func(rw http.ResponseWriter, r *http.Request) {
-		w.mu.Lock()
-		z := w.zones
-		w.mu.Unlock()
-		b, _ := json.Marshal(z)
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Write(b)
 	})
 	// /say — the commons. The world is a REPL between the minds on this box:
 	// a line spoken here is appended to ~/.pilot-commons.jsonl (a file,

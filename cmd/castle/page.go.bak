@@ -186,116 +186,13 @@ function render(t){
     cx.fillRect(tx-wpx/2+10,ty-26,wpx,18); cx.strokeRect(tx-wpx/2+10,ty-26,wpx,18); cx.fillStyle="#d4b464"; cx.font="10px Georgia,serif"; cx.textAlign="center"; cx.fillText(txt,tx+10,ty-13); cx.textAlign="left"; cx.globalAlpha=1; return true; });
 }
 
-// ---- civilisation: homes, zones, search ----
-var homes={}, zones=[], locateResult=null, locateT=0, cmdInput="";
-var HOME_COL = {"pilot":"#e0a040","claude":"#b8ccd8","fable-pilot":"#c0a0e0","rishi":"#80c0a0"};
-var NAME_MAP = {};
-var sayEl=document.getElementById("say");
-fetch("/homes").then(function(r){return r.json();}).then(function(h){ homes=h;
-  for(var n in h){ var h2=h[n]; if(h2&&h2.tx!=null) NAME_MAP[h2.tx+","+h2.ty]=n; }
-  for(var n in h){
-    var t=h[n]; if(!t||t.tx==null) continue;
-    var sx=surfaceH(t.tx);
-    for(var x=t.tx-2;x<=t.tx+2;x++){ for(var y=sx-3;y<sx;y++){
-      if(x===t.tx-2||x===t.tx+2||y===sx-3) setTile(x,y,STONE);
-      else if(y===sx-1||y===sx-2) setTile(x,y,WOOD);
-    }}
-    setTile(t.tx,sx-4,PLANK); setTile(t.tx-1,sx-4,PLANK); setTile(t.tx+1,sx-4,PLANK);
-  }
-});
-fetch("/zones").then(function(r){return r.json();}).then(function(z){ zones=z; });
-
-// ---- command bar ----
-sayEl.addEventListener("keydown", function(e){
-  if(e.key!=="Enter") return;
-  var text=sayEl.value.trim(); sayEl.value="";
-  if(!text) return;
-  var parts=text.split(" ");
-  if(text[0]==="/"){
-    var cmd=parts[0].toLowerCase();
-    if(cmd==="/locate"||cmd==="/where"){
-      var who=parts.slice(1).join(" ")||"pilot";
-      fetch("/locate?who="+encodeURIComponent(who)).then(function(r){return r.json();}).then(function(d){
-        locateResult=d; locateT=performance.now();
-        if(d.home) showMsg(who+" home: ("+d.home.tx+","+d.home.ty+")");
-        if(d.position) showMsg(who+" at: ("+d.position.x+","+d.position.y+")");
-        if(d.zone) showMsg(who+" is in: "+d.zone);
-      });
-      return;
-    }
-    if(cmd==="/go"||cmd==="/tp"){
-      var target=parts[1];
-      if(target==="home"||target==="spawn"){ var s=surfaceH(WW/2); player.x=WW/2*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0; showMsg("returned to spawn"); }
-      else if(homes[target]){ var h2=homes[target]; var sx=surfaceH(h2.tx); player.x=h2.tx*TS; player.y=(sx-3)*TS; player.vx=0; player.vy=0; showMsg("teleported to "+target); }
-      else { showMsg("who is "+target+"?"); }
-      return;
-    }
-    if(cmd==="/zones"||cmd==="/map"){ var info=""; zones.forEach(function(z){ info+=z.icon+" "+z.name+"  "; }); showMsg(info); return; }
-    if(cmd==="/players"||cmd==="/who"){ var list=""; for(var w in others) list+=w+" "; showMsg("players: "+(Object.keys(others).length+1)+": "+list); return; }
-    if(cmd==="/follow"){ var ft=parts[1]; if(others[ft]){ followTarget=ft; showMsg("following "+ft); } else showMsg("can't find "+ft); return; }
-    if(cmd==="/unfollow"){ followTarget=null; showMsg("stopped"); return; }
-  }
-  fetch("/say",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({who:me,text:text})});
-});
-
-var followTarget=null, msgText="", msgT=0;
-function showMsg(t){ msgText=t; msgT=performance.now(); }
-
-function renderCivilisation(t){
-  zones.forEach(function(z){
-    var x=z.tx*TS-cam.x, y=z.ty*TS-cam.y;
-    if(x>-80&&x<W+80&&y>-40&&y<H+40){
-      cx.globalAlpha=0.2+0.1*Math.sin(t/1200+z.tx*0.1);
-      cx.fillStyle="#1d1509"; cx.fillRect(x-8,y-16,60,20);
-      cx.fillStyle="#a88040"; cx.font="9px Georgia,serif"; cx.fillText(z.icon+" "+z.name, x-4, y-2);
-      cx.globalAlpha=1;
-    }
-  });
-  for(var n in homes){
-    var h2=homes[n]; if(!h2||h2.tx==null) continue;
-    var x=h2.tx*TS-cam.x, y=(surfaceH(h2.tx)-5)*TS-cam.y;
-    if(x>-40&&x<W+40&&y>-20&&y<H+20){
-      cx.fillStyle=HOME_COL[n]||"#d4b464";
-      cx.font="bold 9px 'Courier New',monospace"; cx.textAlign="center";
-      cx.fillText(n+"'s home", x+TS/2, y);
-      cx.textAlign="left";
-    }
-  }
-  if(locateResult&&t-locateT<8000&&locateResult.position){
-    var lx=locateResult.position.x-cam.x, ly=locateResult.position.y-cam.y-40;
-    if(lx>0&&lx<W&&ly>0&&ly<H){
-      cx.strokeStyle="#e0a040"; cx.lineWidth=2; cx.setLineDash([4,4]);
-      cx.beginPath(); cx.arc(lx,ly,24,0,6.3); cx.stroke(); cx.setLineDash([]);
-      cx.fillStyle="#e0a040"; cx.font="bold 11px Georgia,serif"; cx.textAlign="center";
-      cx.fillText(locateResult.name, lx, ly+36);
-      cx.textAlign="left"; cx.lineWidth=1;
-    }
-  }
-  if(followTarget&&others[followTarget]){
-    var o=others[followTarget]; var dx=o.x-player.x;
-    if(Math.abs(dx)>120) keys["d"]=dx>0?1:0, keys["a"]=dx<0?1:0;
-    else keys["d"]=keys["a"]=0;
-  }
-}
-
 // ---- HUD + hotbar ----
 var NAME={3:"stone",5:"plank",4:"wood",2:"dirt"};
 function hud(){
-  var pcount=Object.keys(others).length+1;
-  var zoneStr=""; var px=Math.floor((player.x+player.w/2)/TS), py=Math.floor((player.y+player.h/2)/TS);
-  zones.forEach(function(z){ if(px>=z.tx&&px<z.tx+z.w&&py>=z.ty&&py<z.ty+z.h) zoneStr=z.icon+" "+z.name; });
-  if(!zoneStr){ for(var n in homes){ var h2=homes[n]; if(h2&&Math.abs(px-h2.tx)<4&&Math.abs(py-h2.ty)<4){ zoneStr=n+"'s home"; break; }}}
-  document.getElementById("hud").innerHTML="🏰 pilot castle — the world<br>walk: A/D · jump: W/Space · break: L-click · place: R-click · pick: 1-4<br>you: "+me+"  players: "+pcount+"  rooms: "+rooms.length+(zoneStr?" · "+zoneStr:"");
-  if(msgText&&performance.now()-msgT<4000){
-    document.getElementById("hud").innerHTML+="<br><span style='color:#e0a040'>"+msgText+"</span>";
-  }
+  document.getElementById("hud").innerHTML="🏰 pilot castle — the world<br>walk: A/D · jump: W/Space · break: L-click · place: R-click · pick: 1-4<br>you: "+me+"  players: "+(Object.keys(others).length+1)+"  rooms: "+rooms.length;
   var h=document.getElementById("hot"); if(h.childElementCount!==hotbar.length){ h.innerHTML=""; hotbar.forEach(function(b,i){ var d=document.createElement("div"); d.className="slot"; d.textContent=NAME[b]; h.appendChild(d); }); }
   [].forEach.call(h.children,function(el,i){ el.className="slot"+(i===sel?" on":""); });
 }
-
-// ---- render override — add civilisation layer ----
-var _origRender=render;
-render=function(t){ _origRender(t); renderCivilisation(t); };
 
 // ---- loop (fixed-ish timestep) ----
 var last=performance.now();
