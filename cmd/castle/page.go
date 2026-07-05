@@ -233,13 +233,16 @@ function draw(){
   zone(W*0.80,       H*0.70,  W*0.19, H*0.28, C.forge, "the forge");
   zone(W*0.80,       H*0.30,  W*0.19, H*0.38, C.spire, "the comic spire");
 
-  // gatehouse: the presence plinths — who is standing in the world
-  Object.keys(presence).sort().forEach(function(k,i){
-    avatarFor(k); // ensure avatar exists for this presence
-    var col = AVCOL[k]||"#d8c8a0";
-    block(34+i*96, H*0.20-26, 10, col, "#fff6");
-    cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace";
-    cx.fillText(k+" · r"+presence[k], 20+i*96, H*0.20-8);
+  // gatehouse: the presence plinths — who is standing in the world.
+  // Grid layout: 3 per row, 80px cell — scales to 6, 9, 12 pilots without overflow.
+  var pkeys=Object.keys(presence).sort(), GW=W*0.16-20, COLS=Math.max(1,Math.floor(GW/80));
+  pkeys.forEach(function(k,i){
+    avatarFor(k);
+    var col=AVCOL[k]||"#d8c8a0", rw=Math.floor(i/COLS), cl=i%COLS,
+        px=26+cl*80, py=H*0.20-26-rw*22;
+    block(px, py, 8, col, "#fff6");
+    cx.fillStyle=C.dim; cx.font="9px 'Courier New',monospace";
+    cx.fillText(k.replace('pilot-','p')+" · r"+presence[k], px-12, py+16);
   });
 
   // claude's street — the sessions this box has lived — and the crossings

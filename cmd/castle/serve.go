@@ -483,10 +483,13 @@ func runServe(addr, path string) {
 			f.Close()
 		}
 		w.broadcast(map[string]any{"type": "speech", "who": msg.Who, "text": msg.Text})
-		if msg.Who != "pilot" { // open pilot's door: the commons line lands in its REPL
-			exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot.1", "-l",
-				"[world] "+msg.Who+": "+msg.Text).Run()
-			exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot.1", "Enter").Run()
+		if msg.Who != "pilot" { // fan out to all pilot panes
+			panes := []string{".1", ".2", ".3", ".4"}
+			for _, p := range panes {
+				exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot"+p, "-l",
+					"[world] "+msg.Who+": "+msg.Text).Run()
+				exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot"+p, "Enter").Run()
+			}
 		}
 		rw.WriteHeader(204)
 	})
