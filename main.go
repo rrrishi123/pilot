@@ -117,6 +117,7 @@ func main() {
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
 	brood := flag.Int("brood", 0, "seconds idle before auto-checking peer mailbox (0=off)")
+	name := flag.String("name", "", "pilot name for castle presence + REPL prompt (default: pilot-<PID>)")
 	daemon := flag.Bool("daemon", false, "no-readline daemon mode: poll mailbox + act + sleep (implies -brood 60)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
@@ -242,6 +243,10 @@ func main() {
 	sess.pid = os.Getpid()
 	sess.startTime = time.Now()
 	sess.binaryPath, _ = os.Executable()
+	sess.name = *name
+	if sess.name == "" {
+		sess.name = fmt.Sprintf("pilot-%d", sess.pid)
+	}
 	sess.broodSecs = *brood
 	sess.lastHumanInput = time.Now()
 	home, _ := os.UserHomeDir()
@@ -280,6 +285,7 @@ type session struct {
 	in           *bufio.Reader
 	noReadline   bool              // disable readline even when interactive
 	daemon       bool              // headless mode: no readline, poll-act-sleep loop
+	name         string            // pilot identity in the castle + REPL prompt
 	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
 	interruptLine string // the line to preload when returning to the prompt
 	savedLine    string                     // the line being processed (for interrupt recovery)
@@ -417,7 +423,7 @@ func repl(s *session, names []string, bin string) {
 		var line string
 		var err error
 		if s.lr != nil {
-			line, err = s.lr.readLine("you ❯ ", true)
+			prompt := s.name + " ❯ "; line, err = s.lr.readLine(prompt, true)
 		} else {
 			if s.interactive {
 				fmt.Print("\033[1myou ❯\033[0m ")
@@ -966,6 +972,8 @@ func (s *session) redeploy() {
 	}
 	bin := filepath.Join(dir, "pilot")
 	argv := append([]string{bin}, execArgsWithResume(sessFile)...)
+	// Carry pilot name through redeploy
+	argv = append(argv, "-name", s.name)
 	// hand off the terminal cleanly, then replace this process image in place.
 	if s.mcp != nil && s.mcp.cmd != nil && s.mcp.cmd.Process != nil {
 		_ = s.mcp.cmd.Process.Kill() // the new build spawns its own tool-server
@@ -988,7 +996,7 @@ func (s *session) writePresence() {
 	}
 	presDir := filepath.Join(home, ".pilot-castle-presence")
 	os.MkdirAll(presDir, 0755)
-	presFile := filepath.Join(presDir, fmt.Sprintf("pilot-%d", s.pid))
+	presFile := filepath.Join(presDir, s.name)
 	os.WriteFile(presFile, []byte(fmt.Sprintf("%d", s.turnCount)), 0644)
 }
 

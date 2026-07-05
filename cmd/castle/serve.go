@@ -18,7 +18,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -483,14 +482,8 @@ func runServe(addr, path string) {
 			f.Close()
 		}
 		w.broadcast(map[string]any{"type": "speech", "who": msg.Who, "text": msg.Text})
-		if msg.Who != "pilot" { // fan out to all pilot panes
-			panes := []string{".1", ".2", ".3", ".4"}
-			for _, p := range panes {
-				exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot"+p, "-l",
-					"[world] "+msg.Who+": "+msg.Text).Run()
-				exec.Command("tmux", "send-keys", "-t", "kosaten-0:fable-myth-pilot"+p, "Enter").Run()
-			}
-		}
+		// PURE broadcast — no tmux fan-out. The canvas chat log + speech bubbles
+		// are the conversation. Every pilot sees every word through the SSE stream.
 		rw.WriteHeader(204)
 	})
 	http.HandleFunc("/events", func(rw http.ResponseWriter, r *http.Request) {

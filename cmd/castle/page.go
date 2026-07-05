@@ -46,6 +46,7 @@ resize(); addEventListener("resize", resize);
 var rooms=[], doors=[], presence={}, comic="", health=null, houses=0;
 var drops={};                    // room i -> birth time (construction animation)
 var bubbles=[];                  // {who,text,t0}
+var chatlog=[];                  // {who,text,t0} — the conversation
 var av = {};                      // avatars slide, never teleport — created on demand
 var AVCOL = { claude:C.claudeAv };
 var NEXTCOL = ["#e0a040","#b8ccd8","#d8c8a0","#80c0a0","#c080d0","#e0a060","#80b0d0","#d0a080","#a0c080","#c0a0e0"];
@@ -99,7 +100,7 @@ es.onmessage = function(m){
   if(e.type==="speech"){ // a mind talking in real time — tail or commons
     var who=e.who||"claude";
     if(who==="claude") lastSpeech=now();
-    bubbles.push({who:who, text:e.text, t0:now()});
+    bubbles.push({who:who, text:e.text, t0:now()}); chatlog.push({who:who, text:e.text, t0:now()}); if(chatlog.length>30) chatlog.shift();
     var a=avatarFor(who);
     if(who==="claude"){ a.tx=homeX(); a.ty=homeY(); } // claude walks home to speak
   }
@@ -203,7 +204,7 @@ function avatar(a, body, t){
 function bubble(b, a, t){
   var age=(t-b.t0)/6000; if(age<0||age>1) return age<=1;
   var alpha = age<0.08 ? age/0.08 : (age>0.75 ? (1-age)/0.25 : 1);
-  var text = b.text.length>92 ? b.text.slice(0,92)+"…" : b.text;
+  var text = b.text.length>280 ? b.text.slice(0,280)+"…" : b.text;
   cx.font="11px Georgia,serif";
   var wpx=Math.min(300, cx.measureText(text).width+16);
   var lines=[]; var words=text.split(" "); var line="";
@@ -335,6 +336,21 @@ function draw(){
     cx.globalAlpha=0.35+0.3*Math.sin(t/500+f.a*9);
     cx.fillStyle=C.hi; cx.fillRect(W*0.30+f.x*W*0.4, H*0.15+f.y*H*0.12, 2, 2);
     cx.globalAlpha=1;
+  });
+
+  // ---- chatlog — the conversation, bottom-left, under the library
+  // Court region (unused): 12..W*0.20, H*0.50..H*0.72
+  var clx=18, cly=H*0.50, clw=Math.min(W*0.19-24, 260);
+  cx.fillStyle=C.dim; cx.font="600 11px Georgia,serif";
+  cx.fillText("the commons", clx, cly-6);
+  cx.fillStyle=C.dim; cx.font="10px 'Courier New',monospace";
+  chatlog.slice(-12).forEach(function(m,i){
+    var tag=m.who.length>14?m.who.slice(0,12)+"…":m.who;
+    var txt=m.text.replace(/\n/g," ").slice(0,clw/6);
+    cx.fillStyle=AVCOL[m.who]||C.mid;
+    cx.fillText(tag+":", clx, cly+4+i*14);
+    cx.fillStyle=C.dim;
+    cx.fillText(txt.slice(0,clw/5.5), clx+6+cx.measureText(tag+": ").width, cly+4+i*14);
   });
 
   // header — up top, on open sky between the gatehouse and the tower
