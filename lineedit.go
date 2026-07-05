@@ -166,21 +166,26 @@ func (lr *lineReader) readEscSeq() string {
 
 // ── word helpers ──────────────────────────────────────────────────────────────
 
+// a word boundary is whitespace — space OR newline. Treating '\n' as a
+// separator keeps word-motions and word-deletes sane in multi-line input
+// (Ctrl+Backspace stops at the line above, it doesn't swallow the whole buffer).
+func isWordSep(r rune) bool { return r == ' ' || r == '\n' || r == '\t' }
+
 func wordLeftPos(buf []rune, pos int) int {
-	for pos > 0 && buf[pos-1] == ' ' {
+	for pos > 0 && isWordSep(buf[pos-1]) {
 		pos--
 	}
-	for pos > 0 && buf[pos-1] != ' ' {
+	for pos > 0 && !isWordSep(buf[pos-1]) {
 		pos--
 	}
 	return pos
 }
 
 func wordRightPos(buf []rune, pos int) int {
-	for pos < len(buf) && buf[pos] != ' ' {
+	for pos < len(buf) && !isWordSep(buf[pos]) {
 		pos++
 	}
-	for pos < len(buf) && buf[pos] == ' ' {
+	for pos < len(buf) && isWordSep(buf[pos]) {
 		pos++
 	}
 	return pos
@@ -188,10 +193,10 @@ func wordRightPos(buf []rune, pos int) int {
 
 func killWordBack(buf []rune, cursor int) ([]rune, int) {
 	i := cursor
-	for i > 0 && buf[i-1] == ' ' {
+	for i > 0 && isWordSep(buf[i-1]) {
 		i--
 	}
-	for i > 0 && buf[i-1] != ' ' {
+	for i > 0 && !isWordSep(buf[i-1]) {
 		i--
 	}
 	return append(buf[:i], buf[cursor:]...), i
@@ -199,10 +204,10 @@ func killWordBack(buf []rune, cursor int) ([]rune, int) {
 
 func killWordForward(buf []rune, cursor int) ([]rune, int) {
 	i := cursor
-	for i < len(buf) && buf[i] == ' ' {
+	for i < len(buf) && isWordSep(buf[i]) {
 		i++
 	}
-	for i < len(buf) && buf[i] != ' ' {
+	for i < len(buf) && !isWordSep(buf[i]) {
 		i++
 	}
 	return append(buf[:cursor], buf[i:]...), cursor
@@ -217,6 +222,17 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 		return strings.TrimRight(s, "\r\n"), e
 	}
 	defer term.Restore(lr.fd, old)
+
+	// Progressive enhancement: turn on the kitty keyboard protocol (flag 1,
+	// "disambiguate"). THIS is the line that makes the CSI-u parser below
+	// actually fire — without it a modern terminal keeps legacy encodings, so
+	// Shift+Enter is an indistinguishable bare \r (submits instead of newline)
+	// and Ctrl+Backspace is a plain 0x08. With it, those keys arrive as
+	// unambiguous \x1b[13;2u / \x1b[127;5u. Terminals that don't speak the
+	// protocol silently drop the escape and fall back to legacy — no harm.
+	// Popped (LIFO, before Restore) so the terminal is left as we found it.
+	fmt.Fprint(os.Stdout, "\033[>1u")
+	defer fmt.Fprint(os.Stdout, "\033[<u")
 
 	// Refresh terminal width (may have changed since startup)
 	if w, _, e := term.GetSize(lr.fd); e == nil && w > 0 {
@@ -278,11 +294,16 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 			cursor++
 
-		case 127, 8: // Backspace
+		case 127: // Backspace — delete one char
 			if cursor > 0 {
 				buf = append(buf[:cursor-1], buf[cursor:]...)
 				cursor--
 			}
+
+		case 8: // Ctrl+Backspace on terminals that lack the kitty protocol
+			// (they send raw 0x08). Modern terminals send \x7f for plain
+			// backspace, so 0x08 here means the ctrl-modified key: delete word.
+			buf, cursor = killWordBack(buf, cursor)
 
 		case 1: // Ctrl+A
 			cursor = 0
@@ -349,13 +370,15 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 				cursor = wordRightPos(buf, cursor)
 			case "\x7f", "\x08":
 				buf, cursor = killWordBack(buf, cursor)
-			case "[8;127u", "[127;8u":
+			case "[127;5u", "[127;3u", "[8;127u", "[127;8u": // Ctrl/Alt+Backspace (kitty)
 				buf, cursor = killWordBack(buf, cursor)
 			case "[27;8;127~", "[27;5;127~", "[27;3;127~":
 				buf, cursor = killWordBack(buf, cursor)
+			case "[3;5~", "[3;3u": // Ctrl+Delete — delete word forward
+				buf, cursor = killWordForward(buf, cursor)
 			case "d":
 				buf, cursor = killWordForward(buf, cursor)
-			case "[27;2;13~", "[13;2u", "\r":
+			case "[27;2;13~", "[13;2u", "[13;3u", "[13;5u", "\r": // Shift/Alt/Ctrl+Enter → newline
 				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 				cursor++
 			}

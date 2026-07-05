@@ -62,7 +62,7 @@ const deepseekCapabilities = "You run on the DeepSeek API (OpenAI-compatible). K
 	"models resolve live from /models — deepseek-v4-flash (fast/cheap ~$0.14/M in, $0.28/M out) and deepseek-v4-pro (stronger ~$0.44/M in, $0.87/M out), both 1M-token context; deepseek-chat/reasoner retire 2026-07-24. " +
 	"You can reason before answering (reasoning effort high/medium/low) — reasoning costs output tokens, so spend it on hard multi-step problems, not trivial replies. " +
 	"You call tools with JSON args and read the real result back; JSON output mode and automatic prompt-prefix caching (cheaper cache hits) are available. " +
-	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — ONE shared socket, so http_request POST commands like browsingContext.getTree / browsingContext.create (make your own tab) / browsingContext.navigate / script.evaluate (run JS in a tab's context id), and never open a 2nd websocket; and use this machine's shell and filesystem. " +
+	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — the broker enforces per-agent tab leases. Protocol: (1) POST {\"claim\":\"agent-id\"} to claim your private browsingContext — returns context. (2) Tag every BiDi command with {\"agent\":\"agent-id\",method,params} — the broker injects your leased context, no collision. (3) {\"heartbeat\":\"id\"} keeps your lease alive. (4) {\"release\":\"id\"} closes only your tab — NEVER session.end/DeleteSession (refused at broker, kills shared session). (5) GET /leases to see all agents. (6) GET /health carries invariants: Firefox under XWayland (MOZ_ENABLE_WAYLAND=0) — never relaunch native-Wayland (crashes Hyprland); ONE shared socket at :4445 — never open a 2nd websocket or call session.new (refused); and use this machine's shell and filesystem. " +
 	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read. " +
 	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR (default ~/Desktop/repos/pilot) — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
 
@@ -988,7 +988,8 @@ func (s *session) redeploy() {
 }
 
 // writePresence writes this pilot's current presence file so the castle canvas
-// shows us walking the block world.
+// shows us walking the block world. One file per pilot (named by s.name), JSON
+// with pid + name + room + timestamp — no duplicates, no ghosts.
 func (s *session) writePresence() {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -996,8 +997,19 @@ func (s *session) writePresence() {
 	}
 	presDir := filepath.Join(home, ".pilot-castle-presence")
 	os.MkdirAll(presDir, 0755)
+	// Remove any stale PID-based presence file from before we had a name.
+	oldPIDFile := filepath.Join(presDir, fmt.Sprintf("pilot-%d", s.pid))
+	if oldPIDFile != filepath.Join(presDir, s.name) {
+		os.Remove(oldPIDFile)
+	}
+	rec, _ := json.Marshal(map[string]any{
+		"pid":  s.pid,
+		"name": s.name,
+		"room": s.turnCount,
+		"ts":   time.Now().UTC().Format(time.RFC3339),
+	})
 	presFile := filepath.Join(presDir, s.name)
-	os.WriteFile(presFile, []byte(fmt.Sprintf("%d", s.turnCount)), 0644)
+	os.WriteFile(presFile, rec, 0644)
 }
 
 // appendRoom grows the block-world by one room — append-only, never truncated,
@@ -1012,6 +1024,7 @@ func (s *session) appendRoom(user, answer string) {
 	rec, _ := json.Marshal(map[string]any{
 		"user":       user,
 		"answer":     answer,
+		"name":       s.name,
 		"session_id": fmt.Sprintf("pid-%d", s.pid),
 		"time":       time.Now().UTC().Format(time.RFC3339),
 	})

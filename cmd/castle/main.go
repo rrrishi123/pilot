@@ -164,6 +164,15 @@ func readPresence() map[string]int {
 	ents, _ := os.ReadDir(presenceDir)
 	for _, e := range ents {
 		if b, err := os.ReadFile(filepath.Join(presenceDir, e.Name())); err == nil {
+			// Try JSON first: {"pid":N,"name":"pilot-b","room":17,"ts":"..."}
+			var pr struct {
+				Room int `json:"room"`
+			}
+			if json.Unmarshal(b, &pr) == nil && pr.Room > 0 {
+				out[e.Name()] = pr.Room
+				continue
+			}
+			// Fall back to plain number for old-format files
 			var p int
 			if _, err := fmt.Sscan(string(b), &p); err == nil {
 				out[e.Name()] = p
@@ -172,13 +181,24 @@ func readPresence() map[string]int {
 	}
 	return out
 }
-
 func avatar(name string) string {
+
 	switch name {
 	case "pilot":
 		return "☺"
 	case "claude":
 		return "✦"
+	}
+	// Named pilots: pilot-b → PB, pilot-c → PC, daemon → DA
+	if len(name) > 1 {
+		if strings.HasPrefix(name, "pilot-") {
+			rest := strings.TrimPrefix(name, "pilot-")
+			if len(rest) > 0 {
+				return strings.ToUpper(rest[:min(2, len(rest))])
+			}
+		}
+		// Generic: first 2 chars uppercase
+		return strings.ToUpper(name[:min(2, len(name))])
 	}
 	if name != "" {
 		return strings.ToUpper(name[:1])

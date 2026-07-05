@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -482,8 +483,39 @@ func runServe(addr, path string) {
 			f.Close()
 		}
 		w.broadcast(map[string]any{"type": "speech", "who": msg.Who, "text": msg.Text})
-		// PURE broadcast — no tmux fan-out. The canvas chat log + speech bubbles
-		// are the conversation. Every pilot sees every word through the SSE stream.
+
+		// Deliver rishi's message to every pilot's mailbox so they can act on it.
+		if msg.Who != "pilot" && msg.Who != "pilot-b" && msg.Who != "pilot-c" && msg.Who != "daemon" {
+			mailboxDir := os.ExpandEnv("/home/rishi/.pilot/mailbox")
+			os.MkdirAll(mailboxDir, 0700)
+			payload, _ := json.Marshal(map[string]any{
+				"from":    0,
+				"time":    time.Now().UTC().Format(time.RFC3339),
+				"message": msg.Who + ": " + msg.Text,
+			})
+			payload = append(payload, '\n')
+			// Known pilot PIDs from presence files
+			known := map[string]bool{"2416027": true}
+			if ents, err := os.ReadDir(presenceDir); err == nil {
+				for _, e := range ents {
+					if b, err := os.ReadFile(filepath.Join(presenceDir, e.Name())); err == nil {
+						var pr struct {
+							PID int `json:"pid"`
+						}
+						if json.Unmarshal(b, &pr) == nil && pr.PID > 0 {
+							known[fmt.Sprintf("%d", pr.PID)] = true
+						}
+					}
+				}
+			}
+			for pidStr := range known {
+				mb := filepath.Join(mailboxDir, pidStr+".jsonl")
+				if f, err := os.OpenFile(mb, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+					f.Write(payload)
+					f.Close()
+				}
+			}
+		}
 		rw.WriteHeader(204)
 	})
 	http.HandleFunc("/events", func(rw http.ResponseWriter, r *http.Request) {
