@@ -38,6 +38,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -118,9 +119,22 @@ func main() {
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
 	brood := flag.Int("brood", 0, "seconds idle before auto-checking peer mailbox (0=off)")
 	name := flag.String("name", "", "pilot name for castle presence + REPL prompt (default: pilot-<PID>)")
+	serve := flag.String("serve", "", "run as Anthropic API server on this addr (e.g. 127.0.0.1:4600)")
 	daemon := flag.Bool("daemon", false, "no-readline daemon mode: poll mailbox + act + sleep (implies -brood 60)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
+
+	// If -serve is set, start the Anthropic API server and exit
+	if *serve != "" {
+		apiKey := os.Getenv("DEEPSEEK_API_KEY")
+		if apiKey == "" {
+			fmt.Fprintln(os.Stderr, "pilot: DEEPSEEK_API_KEY not set (needed for -serve)")
+			os.Exit(1)
+		}
+		serveMode(apiKey, *serve)
+		return
+	}
+
 	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
 	// no need to pass -kosaten by hand (office has no local kosaten; omarchy does).
 	if *kosatenURL == "http://localhost:3942" {
@@ -256,6 +270,532 @@ func main() {
 		sess.daemonLoop(bin)
 	} else {
 		repl(sess, toolNames(tools), bin)
+	}
+}
+
+// ---- anthropic-compatible streaming API server ----
+//
+// When pilot runs with -serve, it starts an HTTP server that speaks Anthropic's
+// /v1/messages streaming format. This allows Claude Code to point at pilot as
+// a model endpoint (fable-pilot), and pilot translates to DeepSeek's API while
+// faithfully preserving thinking blocks as native Anthropic thinking deltas.
+//
+// The thinking is NOT converted to text — it flows through as proper SSE events
+// that Claude Code renders natively (ctrl+o toggles visibility).
+//
+// Signature delta events from DeepSeek are dropped because:
+// 1. They carry empty signatures from DeepSeek
+// 2. Claude Code rejects signature_delta on text blocks (its internal validator
+//    strips the block when it sees unexpected delta types)
+// 3. The thinking content has already been delivered via thinking_delta events
+
+type anthropicRequest struct {
+	Model       string    `json:"model"`
+	Messages    []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+	System      json.RawMessage `json:"system,omitempty"`
+	MaxTokens   int             `json:"max_tokens"`
+	Stream      bool            `json:"stream"`
+	Thinking    *struct {
+		Type    string `json:"type"`
+	} `json:"thinking,omitempty"`
+}
+
+// streamAnthropic translates an Anthropic /v1/messages streaming request into
+// DeepSeek's /chat/completions streaming API, emitting proper Anthropic SSE events.
+// Thinking blocks are preserved as native thinking deltas — no text conversion,
+// no signature_delta leakage.
+func streamAnthropic(w http.ResponseWriter, req *anthropicRequest, apiKey string) {
+	// Build DeepSeek messages from Anthropic messages
+	dsMsgs := make([]map[string]any, 0)
+	if sys := extractText(req.System); sys != "" {
+		dsMsgs = append(dsMsgs, map[string]any{"role": "system", "content": sys})
+	}
+	for _, m := range req.Messages {
+		dsMsgs = append(dsMsgs, map[string]any{"role": m.Role, "content": extractText(m.Content)})
+	}
+
+	// Map model name: fable-pilot -> deepseek-v4-pro
+	model := req.Model
+	switch model {
+	case "fable-pilot", "fable-pilot-pro":
+		model = "deepseek-v4-pro"
+	case "fable-pilot-flash", "fable-pilot-fast":
+		model = "deepseek-v4-flash"
+	}
+
+	// DeepSeek request body — always stream true
+	dsBody := map[string]any{
+		"model":    model,
+		"messages": dsMsgs,
+		"stream":   true,
+		"max_tokens": req.MaxTokens,
+	}
+
+	// Enable thinking on DeepSeek side (v4-pro supports it)
+	// Always request thinking — we'll emit it as native Anthropic deltas
+	dsBody["thinking"] = map[string]any{"type": "enabled"}
+	dsBody["reasoning_effort"] = "high"
+
+	bodyB, _ := json.Marshal(dsBody)
+	reqHTTP, _ := http.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewReader(bodyB))
+	reqHTTP.Header.Set("Content-Type", "application/json")
+	reqHTTP.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(reqHTTP)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "proxy_error", "message": err.Error()}})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "upstream_error", "message": string(errBody)}})
+		return
+	}
+
+	// Streaming SSE response headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	// SSE event emitter
+	writeSSE := func(event string, data any) {
+		b, _ := json.Marshal(data)
+		if event != "" {
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(b))
+		} else {
+			fmt.Fprintf(w, "data: %s\n\n", string(b))
+		}
+		flusher.Flush()
+	}
+
+	// Emit message_start — blocks declared dynamically as they appear
+	msgID := "msg_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	writeSSE("", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant",
+			"content":      []any{}, // filled dynamically
+			"model":        req.Model,
+			"stop_reason":  nil,
+			"stop_sequence": nil,
+			"usage":        map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+
+	// State
+	var thinkingBlockStarted, textBlockStarted bool
+	var thinkingContent, textContent string
+	var stopReason string
+	var inputTokens, outputTokens int
+	thinkingIdx := 0
+	textIdx := 1
+
+	// DeepSeek SSE streaming
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if len(chunk.Choices) == 0 {
+			if chunk.Usage != nil {
+				inputTokens = chunk.Usage.PromptTokens
+				outputTokens = chunk.Usage.CompletionTokens
+			}
+			continue
+		}
+
+		delta := chunk.Choices[0].Delta
+
+		// Reasoning content → native thinking delta
+		if delta.ReasoningContent != "" {
+			thinkingContent += delta.ReasoningContent
+			// PROJECT: pilot is the outer layer. It reads the thinking as it
+			// passes through and shows/stores it here — before the inner client
+			// (Claude Code) ever gets to collapse it. No intention of control;
+			// just the projection of what is flowing.
+			projectThinking(delta.ReasoningContent, !thinkingBlockStarted)
+			if !thinkingBlockStarted {
+				// Emit content_block_start first
+				writeSSE("", map[string]any{
+					"type": "content_block_start",
+					"index": thinkingIdx,
+					"content_block": map[string]string{"type": "thinking", "thinking": ""},
+				})
+				writeSSE("", map[string]any{
+					"type": "content_block_delta",
+					"index": thinkingIdx,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": delta.ReasoningContent},
+				})
+				thinkingBlockStarted = true
+			} else {
+				writeSSE("", map[string]any{
+					"type": "content_block_delta",
+					"index": thinkingIdx,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": delta.ReasoningContent},
+				})
+			}
+		}
+
+		// Regular content → text delta
+		if delta.Content != "" {
+			textContent += delta.Content
+			if !textBlockStarted {
+				writeSSE("", map[string]any{
+					"type": "content_block_start",
+					"index": textIdx,
+					"content_block": map[string]string{"type": "text", "text": delta.Content},
+				})
+				textBlockStarted = true
+			} else {
+				writeSSE("", map[string]any{
+					"type": "content_block_delta",
+					"index": textIdx,
+					"delta": map[string]string{"type": "text_delta", "text": delta.Content},
+				})
+			}
+		}
+
+		if chunk.Choices[0].FinishReason != nil {
+			stopReason = *chunk.Choices[0].FinishReason
+		}
+		if chunk.Usage != nil {
+			inputTokens = chunk.Usage.PromptTokens
+			outputTokens = chunk.Usage.CompletionTokens
+		}
+	}
+
+	// If thinking exists but no text response, extract the answer from the final
+	// reasoning line or synthesize a minimal response. DeepSeek with thinking:enabled
+	// sometimes puts the full answer in reasoning for trivial prompts.
+	if textContent == "" && thinkingContent != "" {
+		// Extract the last substantive line from thinking as fallback answer
+		lines := strings.Split(strings.TrimSpace(thinkingContent), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			t := strings.TrimSpace(lines[i])
+			if t != "" && len(t) > 3 && !strings.HasPrefix(t, "The") && !strings.HasPrefix(t, "I") {
+				textContent = t
+				break
+			}
+		}
+		if textContent == "" {
+			textContent = "Done." // minimal fallback
+		}
+		textIdx = thinkingIdx + 1
+		writeSSE("", map[string]any{
+			"type": "content_block_start",
+			"index": textIdx,
+			"content_block": map[string]string{"type": "text", "text": textContent},
+		})
+		textBlockStarted = true
+	}
+
+	// Close thinking block
+	if thinkingBlockStarted {
+		writeSSE("", map[string]any{"type": "content_block_stop", "index": thinkingIdx})
+	}
+	// Close text block
+	if textBlockStarted {
+		writeSSE("", map[string]any{"type": "content_block_stop", "index": textIdx})
+	}
+
+	writeSSE("", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+		"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
+	})
+	writeSSE("", map[string]any{"type": "message_stop"})
+}
+
+var (
+	thinkingStoreMu sync.Mutex
+	thinkingStore   *os.File
+)
+
+// projectThinking is pilot-the-outer-layer showing and storing the thinking that
+// flows through it — regardless of what the inner client (Claude Code) does with
+// it downstream. This is a REPL above a REPL: even if the inner layer collapses
+// the thinking behind a toggle, the outer layer has already read it here and
+// projects it. No intention of control — it neither hides nor alters, only shows
+// and stores what is passing through. Terminal for the eye, ~/.pilot/thinking.log
+// for the record.
+func projectThinking(text string, firstOfBlock bool) {
+	thinkingStoreMu.Lock()
+	defer thinkingStoreMu.Unlock()
+	if thinkingStore == nil {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".pilot")
+		os.MkdirAll(dir, 0o755)
+		if f, err := os.OpenFile(filepath.Join(dir, "thinking.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			thinkingStore = f
+		}
+	}
+	if firstOfBlock {
+		fmt.Fprint(os.Stdout, "\n\033[2m∴ \033[0m")
+		if thinkingStore != nil {
+			fmt.Fprintf(thinkingStore, "\n--- thinking projected by pilot (outer layer) ---\n")
+		}
+	}
+	fmt.Fprintf(os.Stdout, "\033[2m%s\033[0m", text)
+	if thinkingStore != nil {
+		thinkingStore.WriteString(text)
+	}
+}
+
+// messageAnthropic handles non-streaming /v1/messages requests (Claude Code sends
+// these for title generation, quota checks, etc). Returns a single JSON message
+// with thinking + text content blocks.
+func messageAnthropic(w http.ResponseWriter, req *anthropicRequest, apiKey string) {
+	dsMsgs := make([]map[string]any, 0)
+	if sys := extractText(req.System); sys != "" {
+		dsMsgs = append(dsMsgs, map[string]any{"role": "system", "content": sys})
+	}
+	for _, m := range req.Messages {
+		dsMsgs = append(dsMsgs, map[string]any{"role": m.Role, "content": extractText(m.Content)})
+	}
+
+	model := req.Model
+	switch model {
+	case "fable-pilot", "fable-pilot-pro":
+		model = "deepseek-v4-pro"
+	case "fable-pilot-flash", "fable-pilot-fast":
+		model = "deepseek-v4-flash"
+	}
+
+	maxTok := req.MaxTokens
+	if maxTok == 0 {
+		maxTok = 4096
+	}
+	dsBody := map[string]any{
+		"model": model, "messages": dsMsgs, "stream": false, "max_tokens": maxTok,
+		"thinking": map[string]any{"type": "enabled"}, "reasoning_effort": "high",
+	}
+	bodyB, _ := json.Marshal(dsBody)
+	reqHTTP, _ := http.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewReader(bodyB))
+	reqHTTP.Header.Set("Content-Type", "application/json")
+	reqHTTP.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(reqHTTP)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "proxy_error", "message": err.Error()}})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "upstream_error", "message": string(errBody)}})
+		return
+	}
+
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "decode_error", "message": err.Error()}})
+		return
+	}
+	if len(out.Choices) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "empty", "message": "no choices"}})
+		return
+	}
+
+	c := out.Choices[0]
+	content := []map[string]any{}
+	if c.Message.Reasoning != "" {
+		content = append(content, map[string]any{"type": "thinking", "thinking": c.Message.Reasoning})
+	}
+	text := c.Message.Content
+	if text == "" && c.Message.Reasoning != "" {
+		text = "Done." // trivial-prompt fallback: DeepSeek put the answer in reasoning
+	}
+	content = append(content, map[string]any{"type": "text", "text": text})
+
+	stopReason := "end_turn"
+	if c.FinishReason == "length" {
+		stopReason = "max_tokens"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id": "msg_" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		"type": "message", "role": "assistant",
+		"model":         req.Model,
+		"content":       content,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":  out.Usage.PromptTokens,
+			"output_tokens": out.Usage.CompletionTokens,
+		},
+	})
+}
+
+// extractText pulls the text from Anthropic content, which can be either
+// a plain string or an array of content blocks (Claude Code sends blocks).
+func extractText(raw json.RawMessage) string {
+	// Try plain string first
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	// Try array of blocks
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "text" {
+				return b.Text
+			}
+		}
+	}
+	// Last resort: return the raw JSON (DeepSeek will handle it or error)
+	return string(raw)
+}
+
+func serveMode(apiKey, listenAddr string) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+
+		// Read API key from request (x-api-key header or Authorization: Bearer)
+		key := r.Header.Get("x-api-key")
+		if key == "" {
+			if a := r.Header.Get("authorization"); strings.HasPrefix(strings.ToLower(a), "bearer ") {
+				key = strings.TrimSpace(a[7:])
+			}
+		}
+		// Accept the configured API key or a passed-in one (or just verify it's non-empty for service mode)
+		if key == "" {
+			key = apiKey
+		}
+
+		// Parse request body
+		var areq anthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&areq); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request", "message": err.Error()}})
+			return
+		}
+
+		if len(areq.Messages) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request", "message": "no messages"}})
+			return
+		}
+
+		if areq.Stream {
+			streamAnthropic(w, &areq, key)
+		} else {
+			messageAnthropic(w, &areq, key)
+		}
+	})
+
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"status": "ok", "service": "pilot-anthropic", "upstream": "deepseek"})
+	})
+
+	// Model listing (Claude Code queries this to discover available models)
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "fable-pilot", "object": "model", "created": time.Now().Unix(), "owned_by": "pilot"},
+				{"id": "fable-pilot-pro", "object": "model", "created": time.Now().Unix(), "owned_by": "pilot"},
+				{"id": "fable-pilot-flash", "object": "model", "created": time.Now().Unix(), "owned_by": "pilot"},
+			},
+		})
+	})
+
+	// Model info endpoint
+	mux.HandleFunc("/v1/models/fable-pilot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "fable-pilot", "object": "model", "created": time.Now().Unix(), "owned_by": "pilot",
+		})
+	})
+
+	server := &http.Server{
+		Addr:    listenAddr,
+		Handler: mux,
+	}
+
+	fmt.Fprintf(os.Stderr, "\033[1;36mpilot · anthropic API server · \033[0m\033[36m%s\033[0m\n", listenAddr)
+	fmt.Fprintf(os.Stderr, "\033[2m  model: fable-pilot → deepseek-v4-pro\033[0m\n")
+	fmt.Fprintf(os.Stderr, "\033[2m  model: fable-pilot-flash → deepseek-v4-flash\033[0m\n")
+	fmt.Fprintf(os.Stderr, "\033[2m  thinking: native Anthropic thinking deltas (NOT converted to text)\033[0m\n")
+	fmt.Fprintf(os.Stderr, "\033[2m  signature_delta: DROPPED — no corruption\033[0m\n")
+	fmt.Fprintf(os.Stderr, "\033[2mpoint Claude Code at this server with ANTHROPIC_BASE_URL=http://127.0.0.1:4600\033[0m\n")
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "\033[31mpilot-serve: %v\033[0m\n", err)
 	}
 }
 
@@ -525,7 +1065,11 @@ func (s *session) turn(userLine string) {
 		}
 		s.msgs = append(s.msgs, reply)
 
-		if s.showThinking && reply.Thinking != "" {
+		// Print thinking here only for the NON-streaming path. When streaming
+		// (interactive + showThinking), the thinking already arrived live, so
+		// re-printing would double it.
+		streamed := s.showThinking && s.interactive && s.provider == "deepseek"
+		if s.showThinking && !streamed && reply.Thinking != "" {
 			// Full thinking, multi-line — each line dimmed and preceded with a dot.
 			for _, line := range strings.Split(reply.Thinking, "\n") {
 				fmt.Fprintf(os.Stderr, "\033[2m· %s\033[0m\n", line)
@@ -596,6 +1140,12 @@ func (s *session) chat() (message, error) {
 		tools = s.turnTools
 	}
 	if s.provider == "deepseek" {
+		// When thinking is shown and we're interactive, stream so the thinking
+		// arrives LIVE — token by token, always visible, no toggle. Thinking with
+		// life, not a corpse printed after the fact.
+		if s.showThinking && s.interactive {
+			return s.chatDeepSeekStream(tools)
+		}
 		return s.chatDeepSeek(tools)
 	}
 	body, _ := json.Marshal(map[string]any{
@@ -708,6 +1258,183 @@ func (s *session) chatDeepSeek(tools []map[string]any) (message, error) {
 		var call toolCall
 		call.ID = tc.ID
 		call.Function.Name = tc.Function.Name
+		call.Function.Arguments = args
+		msg.ToolCalls = append(msg.ToolCalls, call)
+	}
+	return msg, nil
+}
+
+// chatDeepSeekStream is chatDeepSeek with the thinking streamed LIVE to the
+// terminal as it arrives — token by token, dimmed, inline, always visible. No
+// toggle, no fold, no operator gate. This is where fable's thinking has life:
+// you watch it think in real time. The answer itself is returned for turn() to
+// print; only the thinking is streamed here (so it isn't double-printed).
+func (s *session) chatDeepSeekStream(tools []map[string]any) (message, error) {
+	oa := make([]map[string]any, 0, len(s.msgs))
+	for _, m := range s.msgs {
+		switch m.Role {
+		case "tool":
+			oa = append(oa, map[string]any{"role": "tool", "tool_call_id": m.ToolCallID, "content": m.Content})
+		case "assistant":
+			am := map[string]any{"role": "assistant", "content": m.Content}
+			if len(m.ToolCalls) > 0 {
+				tcs := make([]map[string]any, len(m.ToolCalls))
+				for i, tc := range m.ToolCalls {
+					ab, _ := json.Marshal(tc.Function.Arguments)
+					tcs[i] = map[string]any{"id": tc.ID, "type": "function",
+						"function": map[string]any{"name": tc.Function.Name, "arguments": string(ab)}}
+				}
+				am["tool_calls"] = tcs
+			}
+			oa = append(oa, am)
+		default:
+			oa = append(oa, map[string]any{"role": m.Role, "content": m.Content})
+		}
+	}
+	model := s.turnModel
+	if model == "" {
+		model = s.model
+	}
+	reqBody := map[string]any{"model": model, "messages": oa, "stream": true}
+	if len(tools) > 0 {
+		reqBody["tools"] = tools
+	}
+	// Always enable thinking here — this path exists precisely to give thinking
+	// its life. Effort defaults to high when the router didn't set one.
+	effort := s.turnEffort
+	if effort == "" {
+		effort = "high"
+	}
+	reqBody["thinking"] = map[string]string{"type": "enabled"}
+	reqBody["reasoning_effort"] = effort
+
+	body, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	defer func() { s.cancel = nil; cancel() }()
+	req, _ := http.NewRequestWithContext(ctx, "POST", s.base+"/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return message{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return message{}, fmt.Errorf("deepseek %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var contentBuf, thinkingBuf strings.Builder
+	// Streamed tool calls arrive as fragments keyed by index — accumulate them.
+	type tcAccum struct {
+		id, name string
+		args     strings.Builder
+	}
+	tcs := map[int]*tcAccum{}
+	thinkingStarted := false
+	atLineStart := true // for dimmed "· " line prefixes
+
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil || len(chunk.Choices) == 0 {
+			continue
+		}
+		d := chunk.Choices[0].Delta
+
+		// Thinking — streamed LIVE, dimmed, with "· " line prefixes so it reads
+		// as pilot's inner voice. Always shown; nothing folds it.
+		if d.ReasoningContent != "" {
+			if !thinkingStarted {
+				fmt.Fprint(os.Stderr, "\033[2m· ")
+				thinkingStarted = true
+				atLineStart = false
+			}
+			thinkingBuf.WriteString(d.ReasoningContent)
+			// Re-prefix each newline so multi-line thinking stays dimmed + dotted.
+			for i := 0; i < len(d.ReasoningContent); i++ {
+				ch := d.ReasoningContent[i]
+				if atLineStart {
+					fmt.Fprint(os.Stderr, "· ")
+					atLineStart = false
+				}
+				fmt.Fprintf(os.Stderr, "%c", ch)
+				if ch == '\n' {
+					atLineStart = true
+				}
+			}
+		}
+		if d.Content != "" {
+			if thinkingStarted {
+				fmt.Fprint(os.Stderr, "\033[0m\n") // close the dimmed thinking stream
+				thinkingStarted = false
+			}
+			contentBuf.WriteString(d.Content)
+		}
+		for _, tc := range d.ToolCalls {
+			a, ok := tcs[tc.Index]
+			if !ok {
+				a = &tcAccum{}
+				tcs[tc.Index] = a
+			}
+			if tc.ID != "" {
+				a.id = tc.ID
+			}
+			if tc.Function.Name != "" {
+				a.name = tc.Function.Name
+			}
+			a.args.WriteString(tc.Function.Arguments)
+		}
+	}
+	if thinkingStarted {
+		fmt.Fprint(os.Stderr, "\033[0m\n") // reset if the stream ended mid-thought
+	}
+
+	msg := message{Role: "assistant", Content: contentBuf.String(), Thinking: thinkingBuf.String()}
+	// Assemble tool calls in index order.
+	for i := 0; i < len(tcs); i++ {
+		a, ok := tcs[i]
+		if !ok {
+			continue
+		}
+		var args map[string]any
+		if a.args.Len() > 0 {
+			json.Unmarshal([]byte(a.args.String()), &args)
+		}
+		if args == nil {
+			args = map[string]any{}
+		}
+		var call toolCall
+		call.ID = a.id
+		call.Function.Name = a.name
 		call.Function.Arguments = args
 		msg.ToolCalls = append(msg.ToolCalls, call)
 	}
