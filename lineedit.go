@@ -141,7 +141,7 @@ func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
 		fmt.Fprintf(os.Stdout, "\033[%dC", col)
 	}
 
-	lr.oldRows = row // for next render's "move back N rows"
+	lr.oldRows = newRows // total height of what we just drew — next render moves back this many
 	fmt.Fprint(os.Stdout, "\033[?25h") // show cursor
 }
 
@@ -165,6 +165,27 @@ func (lr *lineReader) readEscSeq() string {
 }
 
 // ── word helpers ──────────────────────────────────────────────────────────────
+
+// readPaste reads characters after a bracketed paste start ([200~).
+// Returns all characters up to (but not including) the [201~ terminator.
+// This avoids rendering after every single character of a large paste.
+func (lr *lineReader) readPaste() []rune {
+	var out []rune
+	for {
+		r, _, err := lr.in.ReadRune()
+		if err != nil {
+			return out
+		}
+		if r == 27 {
+			seq := lr.readEscSeq()
+			if seq == "[201~" {
+				return out
+			}
+			continue
+		}
+		out = append(out, r)
+	}
+}
 
 // a word boundary is whitespace — space OR newline. Treating '\n' as a
 // separator keeps word-motions and word-deletes sane in multi-line input
@@ -232,6 +253,13 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 	// protocol silently drop the escape and fall back to legacy — no harm.
 	// Popped (LIFO, before Restore) so the terminal is left as we found it.
 	fmt.Fprint(os.Stdout, "\033[>1u")
+
+	// Enable bracketed paste so pasted text is wrapped in [200~...[201~.
+	// This lets us batch-insert the whole paste with a single render instead of
+	// processing each character individually (which would render once per char).
+	fmt.Fprint(os.Stdout, "\033[?2004h")
+	defer fmt.Fprint(os.Stdout, "\033[?2004l")
+
 	defer fmt.Fprint(os.Stdout, "\033[<u")
 
 	// Refresh terminal width (may have changed since startup)
@@ -381,6 +409,13 @@ func (lr *lineReader) readLine(prompt string, record bool) (string, error) {
 			case "[27;2;13~", "[13;2u", "[13;3u", "[13;5u", "\r": // Shift/Alt/Ctrl+Enter → newline
 				buf = append(buf[:cursor], append([]rune{'\n'}, buf[cursor:]...)...)
 				cursor++
+
+			case "[200~": // bracketed paste start — batch-insert everything at once
+				pasted := lr.readPaste()
+				if len(pasted) > 0 {
+					buf = append(buf[:cursor], append(pasted, buf[cursor:]...)...)
+					cursor += len(pasted)
+				}
 			}
 
 		default:
