@@ -18,11 +18,14 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"runtime"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"os/exec"
+	"syscall"
 	"bufio"
 )
 
@@ -32,6 +35,7 @@ type xy struct {
 }
 
 type wireRoom struct {
+	Name string  `json:"n"`
 	U string  `json:"u"`
 	A string  `json:"a"`
 	X float64 `json:"x"`
@@ -65,6 +69,15 @@ type world struct {
 	homesPath string
 	agentPos  map[string]agentPos
 	zones     []zoneDef
+	gopherBus *outputBus
+}
+
+type toolCall struct {
+	ID       string         `json:"id,omitempty"`
+	Function struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	} `json:"function"`
 }
 
 type agentPos struct {
@@ -435,6 +448,45 @@ func (w *world) watchWire() {
 
 // watchHealth — :3942/health is kosaten's one free read; the towers and the
 // courtyard breathe from it.
+func (w *world) watchPositions() {
+	for range time.Tick(8 * time.Second) {
+		var updates []map[string]any
+		w.mu.Lock()
+		now := time.Now().UnixMilli()
+
+		// Keep the three gopher pilots visible on the minimap
+		gopherTiles := map[string]int{"pilot-a": 61, "pilot-b": -54, "pilot-c": 46}
+		for name, tx := range gopherTiles {
+			px := tx*30 + 15
+			py := -240
+			if existing, ok := w.agentPos[name]; !ok || now-existing.At > 30000 {
+				w.agentPos[name] = agentPos{Who: name, X: px, Y: py, At: now}
+				updates = append(updates, map[string]any{"type": "pos", "who": name, "x": px, "y": py})
+			}
+		}
+
+		for name, home := range w.homes {
+			if home == nil {
+				continue
+			}
+			tx, ty := home["tx"], home["ty"]
+			if tx == 0 && ty == 0 {
+				continue
+			}
+			px := tx * 30 + 15
+			py := -240
+			if existing, ok := w.agentPos[name]; !ok || now-existing.At > 30000 {
+				w.agentPos[name] = agentPos{Who: name, X: px, Y: py, At: now}
+				updates = append(updates, map[string]any{"type": "pos", "who": name, "x": px, "y": py})
+			}
+		}
+		w.mu.Unlock()
+		for _, u := range updates {
+			w.broadcast(u)
+		}
+	}
+}
+
 func (w *world) watchHealth() {
 	for range time.Tick(15 * time.Second) {
 		resp, err := http.Get("http://localhost:3942/health")
@@ -467,7 +519,7 @@ func (w *world) worldJSON() []byte {
 	defer w.mu.Unlock()
 	rooms := make([]wireRoom, len(w.rooms))
 	for i, r := range w.rooms {
-		rooms[i] = wireRoom{clip(r.User, 160), clip(r.Answer, 220), w.pos[i].X, w.pos[i].Y}
+		rooms[i] = wireRoom{Name: r.Name, U: clip(r.User, 160), A: clip(r.Answer, 220), X: w.pos[i].X, Y: w.pos[i].Y}
 	}
 	var doors []wireDoor
 	for i, ds := range w.doors {
@@ -540,6 +592,10 @@ func runServe(addr, path string) {
 	go w.watchHealth()
 	go w.watchWire()
 
+	go w.watchPositions()
+
+	// Spawn the three pilot gophers inside the castle
+	w.SpawnGophers()
 	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(rw, page)
@@ -712,6 +768,81 @@ func runServe(addr, path string) {
 		}
 		rw.WriteHeader(204)
 	})
+	// /spawn — generative civilisation. POST here to birth a new pilot process.
+	// Designed three-way (claude + pilot-b + pilot-c, 2026-07-06): the castle is
+	// the natural spawner — always running when the world is, knows the cast,
+	// can reach the pilot binary and env. The spawned pilot is a SIBLING (Setsid),
+	// not a child — it outlives castle restarts.
+	//   POST /spawn {"name":"forge-worker","instructions":"...","brood_secs":60}
+	//   → 200 {"ok":true,"pid":...,"name":"forge-worker","mailbox":"..."}
+	http.HandleFunc("/spawn", func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(rw, "POST only", 405)
+			return
+		}
+		var req struct {
+			Name         string `json:"name"`
+			Instructions string `json:"instructions"`
+			BroodSecs    int    `json:"brood_secs"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil || req.Name == "" {
+			http.Error(rw, `{"error":"name is required"}`, 400)
+			return
+		}
+		if req.BroodSecs <= 0 {
+			req.BroodSecs = 60
+		}
+		pilotDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
+		pilotBin := filepath.Join(pilotDir, "pilot")
+		if _, err := os.Stat(pilotBin); os.IsNotExist(err) {
+			pilotBin = "pilot" // final fallback: PATH
+		}
+		mailboxDir := os.ExpandEnv("$HOME/.pilot/mailbox")
+		os.MkdirAll(mailboxDir, 0700)
+
+		// Write initial instructions BEFORE spawn so there is no race: the
+		// daemon reads {name}.jsonl on its very first poll, before it even
+		// knows its PID. After bootstrap the daemon switches to the PID-based
+		// path for runtime mail — the name path is bootstrap only.
+		if req.Instructions != "" {
+			payload, _ := json.Marshal(map[string]any{
+				"from":    0,
+				"time":    time.Now().UTC().Format(time.RFC3339),
+				"message": req.Instructions,
+			})
+			payload = append(payload, '\n')
+			os.WriteFile(filepath.Join(mailboxDir, req.Name+".jsonl"), payload, 0600)
+		}
+
+		// Spawn: Setsid so the pilot is a sibling, not our child
+		cmd := exec.Command(pilotBin,
+			"--daemon",
+			"-name", req.Name,
+			"-castle", w.path,
+			"-brood", fmt.Sprint(req.BroodSecs),
+			"-kosaten", "http://localhost:3942",
+		)
+		cmd.Dir = filepath.Dir(pilotBin)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		cmd.Env = os.Environ()
+		if err := cmd.Start(); err != nil {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(500)
+			fmt.Fprintf(rw, `{"error":"spawn failed: %v"}`, err)
+			return
+		}
+		pid := cmd.Process.Pid
+
+		// Let the world see a new mind being born
+		w.broadcast(map[string]any{
+			"type": "spawn", "name": req.Name, "pid": pid,
+			"brood_secs": req.BroodSecs, "at": time.Now().UTC().Format(time.RFC3339),
+		})
+		rw.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(rw, `{"ok":true,"pid":%d,"name":%q,"mailbox":%q}`,
+			pid, req.Name, fmt.Sprintf("%s/%s.jsonl", mailboxDir, req.Name))
+	})
+
 	http.HandleFunc("/events", func(rw http.ResponseWriter, r *http.Request) {
 		fl, ok := rw.(http.Flusher)
 		if !ok {
@@ -734,6 +865,44 @@ func runServe(addr, path string) {
 				return
 			}
 		}
+	})
+
+	// /gophers — SSE stream of gopher mirror output
+	http.HandleFunc("/gophers", func(rw http.ResponseWriter, r *http.Request) {
+		fl, ok := rw.(http.Flusher)
+		if !ok {
+			http.Error(rw, "no stream", 500)
+			return
+		}
+		rw.Header().Set("Content-Type", "text/event-stream")
+		rw.Header().Set("Cache-Control", "no-cache")
+		w.mu.Lock()
+		bus := w.gopherBus
+		w.mu.Unlock()
+		if bus == nil {
+			fmt.Fprintf(rw, "data: {\"n\":\"system\",\"t\":\"No gopher bus available\",\"k\":\"think\"}\n\n")
+			fl.Flush()
+			return
+		}
+		ch := make(chan gopherOutput, 64)
+		bus.subscribe(ch)
+		defer bus.unsubscribe(ch)
+		for {
+			select {
+			case o := <-ch:
+				b, _ := json.Marshal(o)
+				fmt.Fprintf(rw, "data: %s\n\n", string(b))
+				fl.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+	http.HandleFunc("/debug/goroutines", func(rw http.ResponseWriter, r *http.Request) {
+		b := make([]byte, 1<<20)
+		n := runtime.Stack(b, true)
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.Write(b[:n])
 	})
 	fmt.Printf("castle world on %s — %d rooms, watching %s\n", addr, len(rooms), path)
 	if err := http.ListenAndServe(addr, nil); err != nil {
