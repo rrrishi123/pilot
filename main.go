@@ -987,7 +987,10 @@ func (s *session) redeploy() {
 	argv = append(argv, "-name", s.name)
 	// hand off the terminal cleanly, then replace this process image in place.
 	if s.mcp != nil && s.mcp.cmd != nil && s.mcp.cmd.Process != nil {
-		_ = s.mcp.cmd.Process.Kill() // the new build spawns its own tool-server
+		// Kill the whole process group so http-mcp doesnt become a zombie
+		syscall.Kill(-s.mcp.cmd.Process.Pid, syscall.SIGTERM)
+		time.Sleep(100 * time.Millisecond)
+		syscall.Kill(-s.mcp.cmd.Process.Pid, syscall.SIGKILL)
 	}
 	if s.lr != nil {
 		s.lr.saveHistory() // persist before re-exec (the terminal is already restored per readLine)
