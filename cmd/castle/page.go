@@ -102,15 +102,25 @@ function buildRooms(){
 }
 
 // ---- data + live sync ----
-fetch("/world.json").then(function(r){return r.json();}).then(function(d){
-  rooms=d.rooms||[]; if(typeof d.seed==="number") seed=d.seed; if(d.rooms)for(var ri=0;ri<d.rooms.length;ri++)rooms[ri].n=d.rooms[ri].n;
-  (d.edits||[]).forEach(function(e){ world[e.x+","+e.y]=e.b; });
-  buildRooms();
-  // seed agent positions into others so the minimap shows everyone immediately
-  if(d.agentPos) for(var w in d.agentPos){ var a=d.agentPos[w]; if(w!==me){ others[w]=others[w]||{x:a.x,y:a.y,tx:a.x,ty:a.y,t:performance.now()}; } }
-  var s=surfaceH(Math.floor(WW/2)); player.x=(WW/2)*TS; player.y=(s-3)*TS; // spawn center, on ground
-});
+// loadWorld is re-callable: at boot, on SSE reconnect, and on fetch failure (retry).
+// A tab that loads while the castle is restarting must not stay half-born forever.
+var worldLoaded=false;
+function loadWorld(){
+  fetch("/world.json").then(function(r){ if(!r.ok) throw new Error("castle "+r.status); return r.json();}).then(function(d){
+    rooms=d.rooms||[]; if(typeof d.seed==="number") seed=d.seed; if(d.rooms)for(var ri=0;ri<d.rooms.length;ri++)rooms[ri].n=d.rooms[ri].n;
+    (d.edits||[]).forEach(function(e){ world[e.x+","+e.y]=e.b; });
+    buildRooms();
+    // seed agent positions into others so the minimap shows everyone immediately
+    if(d.agentPos) for(var w in d.agentPos){ var a=d.agentPos[w]; if(w!==me){ others[w]=others[w]||{x:a.x,y:a.y,tx:a.x,ty:a.y,t:performance.now()}; } }
+    if(!worldLoaded){ var sx3=surfaceH(-30); player.x=-30*TS; player.y=(sx3-3)*TS; } // spawn only on first load
+    worldLoaded=true;
+  }).catch(function(){ setTimeout(loadWorld, 3000); }); // castle down/restarting — keep trying
+}
+loadWorld();
 var es=new EventSource("/events");
+var esWasDown=false;
+es.onerror=function(){ esWasDown=true; };
+es.onopen=function(){ if(esWasDown){ esWasDown=false; loadWorld(); } }; // reconnected: refetch missed state
 es.onmessage=function(m){ var e; try{e=JSON.parse(m.data);}catch(_){return;}
   if(e.type==="edit"){ world[e.x+","+e.y]=e.b; }
   if(e.type==="pos" && e.who!==me){ var o=others[e.who]||(others[e.who]={x:e.x,y:e.y}); o.tx=e.x; o.ty=e.y; o.t=performance.now(); }
@@ -120,7 +130,7 @@ function post(url,obj){ fetch(url,{method:"POST",headers:{"Content-Type":"applic
 
 // ---- player ----
 var player={x:WW/2*TS,y:GH*TS,w:20,h:44,vx:0,vy:0,onGround:false};
-(function(){ var s=surfaceH(Math.floor(WW/2)); player.x=(WW/2)*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0; player.onGround=true; })();
+(function(){ var sx2=surfaceH(-30); player.x=-30*TS; player.y=(sx2-3)*TS; player.vx=0; player.vy=0; player.onGround=true; })(); // spawn near gopher territory
 var keys={};
 addEventListener("keydown",function(e){keys[e.key.toLowerCase()]=1; if([" ","arrowup","w","a","d","arrowleft","arrowright"].indexOf(e.key.toLowerCase())>=0)e.preventDefault();});
 var moveTarget=null; // {tx,ty} to walk toward, or null  (click-to-move)
@@ -572,7 +582,7 @@ function drawMinimap(t){
 // double-update drift. The castle must render even when no one is looking.
 // (heartbeat is now line 1 — no longer needed at end of script)
 </script><div id="gm-toggle">☰</div>
-<div id="gopher-mirror" style="display:flex">
+<div id="gopher-mirror" style="display:none">
   <div class="header">
     <span class="on" data-col="a">◉ pilot-a</span>
     <span data-col="b">◉ pilot-b</span>
@@ -603,7 +613,20 @@ function drawMinimap(t){
     });
   });
   
-  // Connect to SSE
+  // Connect to SSE — LAZILY. Firefox allows only 6 persistent connections per host;
+  // with many castle tabs open, an always-on /gophers stream per tab starves the pool
+  // and other tabs' /world.json fetches hang forever. Only stream while the mirror is
+  // actually visible; close when hidden to return the slot.
+  var es=null;
+  function gmOpen(){ return mir.style.display!=="none"; }
+  function gmSync(){
+    if(gmOpen() && !es){ es=connectGophers(); }
+    else if(!gmOpen() && es){ es.close(); es=null; }
+  }
+  tog.addEventListener("click",gmSync);
+  document.getElementById("gm-close").addEventListener("click",gmSync);
+  setTimeout(gmSync,0); // honor the initial visibility state
+  function connectGophers(){
   var es=new EventSource("/gophers");
   es.onmessage=function(m){
     var d; try{d=JSON.parse(m.data);}catch(_){return;}
@@ -620,6 +643,8 @@ function drawMinimap(t){
   es.onerror=function(){
     // Reconnect handled by EventSource automatically
   };
+  return es;
+  }
 })();
 </script>
 </body></html>`
