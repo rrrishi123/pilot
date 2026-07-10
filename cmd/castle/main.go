@@ -33,7 +33,8 @@ import (
 )
 
 type room struct {
-	User   string `json:"user"`
+	User string `json:"user"`
+	Name   string `json:"name"`
 	Answer string `json:"answer"`
 }
 
@@ -94,6 +95,15 @@ func tokens(s string) map[string]bool {
 // buildDoors — pilot's idea: connect rooms whose words overlap (Jaccard). Each
 // room keeps its strongest few doors, so the castle is a graph, not a hallway.
 func buildDoors(rooms []room) [][]door {
+	// Scale guard: the all-pairs Jaccard below is O(n²). At n=7379 (the castle
+	// grew 20× as pilots appended rooms) that is ~54M pair-comparisons each over
+	// token sets — billions of ops — and it hangs startup AND every incremental
+	// append (watchRooms recomputes it). The game client never draws doors, and
+	// world.json's doors only fed the legacy top-down canvas, so above a
+	// threshold return no doors. Rooms stay chronologically walkable regardless.
+	if len(rooms) > 1200 {
+		return make([][]door, len(rooms))
+	}
 	toks := make([]map[string]bool, len(rooms))
 	for i, r := range rooms {
 		toks[i] = tokens(r.User + " " + r.Answer)

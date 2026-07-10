@@ -129,6 +129,19 @@ func fullLayout(rooms []room, doors [][]door) []xy {
 		a := float64(i)*2.39996 + rng.Float64()*0.35
 		p[i] = xy{r * math.Cos(a), r * math.Sin(a)}
 	}
+	// Scale guard: BOTH the 260 × O(n²) relaxation below AND snap() (collision
+	// probing over a dense spiral) explode at large n. At n=7379 — the castle grew
+	// 20× as pilots appended rooms — that hangs startup for minutes. The game
+	// client places huts by index and never reads these coordinates (only the
+	// legacy top-down canvas did), so for large n just lay them on a trivial
+	// O(n) grid: instant, non-overlapping, good enough for anything that reads x/y.
+	if n > 1200 {
+		const cols = 64
+		for i := range p {
+			p[i] = xy{float64(i%cols) * 2, float64(i/cols) * 2}
+		}
+		return p
+	}
 	pull := func(i, j int, k float64) {
 		dx, dy := p[j].X-p[i].X, p[j].Y-p[i].Y
 		p[i].X += dx * k
@@ -597,8 +610,16 @@ func runServe(addr, path string) {
 
 	go w.watchPositions()
 
-	// Spawn the three pilot gophers inside the castle
-	SpawnGophers(w)
+	// Spawn the three pilot gophers inside the castle — in the BACKGROUND, so a
+	// slow/blocking gopher init (DeepSeek reachability, history load) can never
+	// stop the world server from binding. The game is the core; the gophers are
+	// an enhancement — a peripheral must never hang the core (the lesson of the
+	// vite deadlock and healer-before-patient). Deferred until after the routes
+	// register and ListenAndServe is live.
+	go func() {
+		defer func() { _ = recover() }() // a gopher panic must not take the world down
+		SpawnGophers(w)
+	}()
 	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(rw, page)
