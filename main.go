@@ -779,7 +779,9 @@ func (s *session) route(userLine string) {
 // plus its assistant/tool exchange), never the current one — so tool_call/result
 // pairs stay intact for the OpenAI/DeepSeek message format.
 func (s *session) compact() {
-	const budget = 2_000_000 // chars — under a 1M-token window (~4M chars avg) with headroom
+	const budget = 1_500_000 // chars — dense JSON tokenizes at ~1.8 chars/token (observed: 2M chars
+	// hit 1,091,115 tokens, over DeepSeek's 1,048,565 cap and unrecoverable), so
+	// 1.5M chars ≈ 830k tokens worst case: real headroom under the 1M-token window.
 	size := func() int {
 		n := 0
 		for _, m := range s.msgs {
