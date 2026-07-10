@@ -232,10 +232,7 @@ func seededHome(name string, seed int64) (int, int) {
 	}
 	r := h ^ (seed * 7)
 	tx := int((r % 200) - 100 + (r/7)%100)
-	ty := -8
-	if ty > -3 {
-		ty = -3
-	}
+	ty := surfaceH(tx, seed)
 	return tx, ty
 }
 
@@ -474,7 +471,7 @@ func (w *world) watchPositions() {
 		gopherTiles := map[string]int{"pilot-a": 61, "pilot-b": -54, "pilot-c": 46}
 		for name, tx := range gopherTiles {
 			px := tx*30 + 15
-			py := -240
+			py := surfaceH(tx, w.seed)*30 + 15
 			if existing, ok := w.agentPos[name]; !ok || now-existing.At > 30000 {
 				w.agentPos[name] = agentPos{Who: name, X: px, Y: py, At: now}
 				updates = append(updates, map[string]any{"type": "pos", "who": name, "x": px, "y": py})
@@ -490,7 +487,7 @@ func (w *world) watchPositions() {
 				continue
 			}
 			px := tx * 30 + 15
-			py := -240
+			py := surfaceH(tx, w.seed)*30 + 15
 			if existing, ok := w.agentPos[name]; !ok || now-existing.At > 30000 {
 				w.agentPos[name] = agentPos{Who: name, X: px, Y: py, At: now}
 				updates = append(updates, map[string]any{"type": "pos", "who": name, "x": px, "y": py})
@@ -678,6 +675,23 @@ func runServe(addr, path string) {
 		w.agentPos[p.Who] = agentPos{Who: p.Who, X: p.X, Y: p.Y, At: time.Now().UnixMilli()}
 		w.mu.Unlock()
 		rw.WriteHeader(204)
+	})
+	// /codex — the world explains itself. A newcomer (or a new kind of mind) can learn
+	// every category of thing that exists here without reading the source.
+	http.HandleFunc("/codex", func(rw http.ResponseWriter, r *http.Request) {
+		w.mu.Lock()
+		counts := map[string]int{"rooms": len(w.rooms), "homes": len(w.homes), "zones": len(w.zones), "agents": len(w.agentPos), "edits": len(w.edits)}
+		w.mu.Unlock()
+		b, _ := json.MarshalIndent(map[string]any{
+			"what":  "pilot castle — a 2D side-view shared world. Everything persists by inscription: rooms are turns, blocks are edits, deletion is an append of air.",
+			"verbs": []string{"walk (A/D)", "jump (W/Space)", "break (L-click)", "place (R-click, pick 1-4)"},
+			"blocks": map[string]string{"0": "air (breaking writes this)", "1": "grass", "2": "dirt", "3": "stone", "4": "wood", "5": "plank", "6": "leaf (passable)"},
+			"api": []string{"GET /world.json", "GET /codex", "GET /homes", "GET /zones", "GET /locate?who=", "GET /events (SSE: edits/pos/speech)", "GET /gophers (SSE: gopher minds)", "POST /edit {who,x,y,b}", "POST /pos {who,x,y}", "POST /say {who,text}"},
+			"counts": counts,
+			"residents": "gophers pilot-a/b/c (minds with tools, living inside), claudes, pilots past (ghosts — presence outlives death), the anthropologist (a witness; its pagoda stands at 26,37)",
+		}, "", "  ")
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write(b)
 	})
 	http.HandleFunc("/homes", func(rw http.ResponseWriter, r *http.Request) {
 		w.mu.Lock()
@@ -919,6 +933,9 @@ func runServe(addr, path string) {
 				fl.Flush()
 			case <-r.Context().Done():
 				return
+			}
+		}
+	})
 
 	// /health — returns JSON status for monitoring
 	http.HandleFunc("/health", func(rw http.ResponseWriter, r *http.Request) {
@@ -930,9 +947,6 @@ func runServe(addr, path string) {
 			"gophers": len(w.gopherBus.subs),
 			"uptime": time.Since(startedAt).String(),
 		})
-	})
-			}
-		}
 	})
 	http.HandleFunc("/debug/goroutines", func(rw http.ResponseWriter, r *http.Request) {
 		b := make([]byte, 1<<20)

@@ -86,6 +86,25 @@ function terrain(tx,ty){ // base tile before edits
 }
 function tileAt(tx,ty){ var k=tx+","+ty; if(k in world) return world[k]; return terrain(tx,ty); }
 function setTile(tx,ty,v){ world[tx+","+ty]=v; }
+// realSurface: the actual standable row at tx — procedural terrain PLUS whatever the
+// civilisation built over it. Teleports that use raw surfaceH() embed avatars inside
+// player-built structures ("stuck on the very blocks that came from you").
+function realSurface(tx){
+  var s=surfaceH(tx), guard=0;
+  while(guard++<500 && (SOLID[tileAt(tx,s-1)]||SOLID[tileAt(tx,s-2)]||SOLID[tileAt(tx,s-3)])) s--;
+  return s;
+}
+// unstick: lift an embedded player straight up to daylight. Physics cannot X-move an
+// overlapped body, so an embedded avatar is otherwise trapped until someone breaks it out.
+function unstick(){
+  var guard=0;
+  while(guard++<500){
+    var tx=Math.floor((player.x+player.w/2)/TS);
+    var headT=Math.floor(player.y/TS), feetT=Math.floor((player.y+player.h-1)/TS);
+    if(!SOLID[tileAt(tx,headT)]&&!SOLID[tileAt(tx,feetT)]) break;
+    player.y-=TS;
+  }
+}
 
 // rooms become wood houses standing on the surface, spread across the world
 function buildRooms(){
@@ -112,7 +131,7 @@ function loadWorld(){
     buildRooms();
     // seed agent positions into others so the minimap shows everyone immediately
     if(d.agentPos) for(var w in d.agentPos){ var a=d.agentPos[w]; if(w!==me){ others[w]=others[w]||{x:a.x,y:a.y,tx:a.x,ty:a.y,t:performance.now()}; } }
-    if(!worldLoaded){ var sx3=surfaceH(-30); player.x=-30*TS; player.y=(sx3-3)*TS; } // spawn only on first load
+    if(!worldLoaded){ var sx3=realSurface(-30); player.x=-30*TS; player.y=(sx3-3)*TS; unstick(); } // spawn only on first load
     worldLoaded=true;
   }).catch(function(){ setTimeout(loadWorld, 3000); }); // castle down/restarting — keep trying
 }
@@ -370,8 +389,8 @@ sayEl.addEventListener("keydown", function(e){
         showMsg("jumped to gophers at commons (-30,-8)");
         return;
       }
-      if(target==="home"||target==="spawn"){ var s=surfaceH(WW/2); player.x=WW/2*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0; showMsg("returned to spawn"); }
-      else if(homes[target]){ var h2=homes[target]; var sx=surfaceH(h2.tx); player.x=h2.tx*TS; player.y=(sx-3)*TS; player.vx=0; player.vy=0; showMsg("teleported to "+target); }
+      if(target==="home"||target==="spawn"){ var s=realSurface(WW/2); player.x=WW/2*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0; unstick(); showMsg("returned to spawn"); }
+      else if(homes[target]){ var h2=homes[target]; var sx=realSurface(h2.tx); player.x=h2.tx*TS; player.y=(sx-3)*TS; player.vx=0; player.vy=0; unstick(); showMsg("teleported to "+target); }
       else { showMsg("who is "+target+"?"); }
       return;
     }
@@ -456,7 +475,7 @@ mmCv.addEventListener("mousedown",function(e){
   var s=surfaceH(w.tx);
   // SHIFT+click = instant teleport (like RTS minimap)
   if(e.shiftKey){
-    player.x=w.tx*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0;
+    player.x=w.tx*TS; player.y=(realSurface(w.tx)-3)*TS; player.vx=0; player.vy=0; unstick();
     moveTarget=null;
     showMsg("teleported to ("+w.tx+","+w.ty+")");
   } else {
