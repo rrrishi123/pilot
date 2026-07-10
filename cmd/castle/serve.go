@@ -50,6 +50,7 @@ type wireDoor struct {
 
 type world struct {
 	mu       sync.Mutex
+	fileMu   sync.Mutex
 	path     string
 	rooms    []room
 	doors    [][]door
@@ -373,6 +374,8 @@ func (w *world) watchComic() {
 // in this world: a file, believed.
 var wireDir = os.ExpandEnv("$HOME/.claude/projects/-home-rishi-Work")
 
+var startedAt = time.Now()
+
 func (w *world) watchWire() {
 	var curFile string
 	var offset int64
@@ -595,7 +598,7 @@ func runServe(addr, path string) {
 	go w.watchPositions()
 
 	// Spawn the three pilot gophers inside the castle
-	w.SpawnGophers()
+	SpawnGophers(w)
 	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(rw, page)
@@ -895,6 +898,18 @@ func runServe(addr, path string) {
 				fl.Flush()
 			case <-r.Context().Done():
 				return
+
+	// /health — returns JSON status for monitoring
+	http.HandleFunc("/health", func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(rw).Encode(map[string]any{
+			"status": "ok",
+			"rooms":  len(w.rooms),
+			"gophers": len(w.gopherBus.subs),
+			"uptime": time.Since(startedAt).String(),
+		})
+	})
 			}
 		}
 	})
