@@ -114,6 +114,7 @@ func main() {
 		"file for the tool-server's logs, so they stay out of the chat")
 	kosatenURL := flag.String("kosaten", "http://localhost:3942", "kosaten MCP URL to bridge its curated tools (empty to disable)")
 	noReadline := flag.Bool("no-readline", false, "disable readline line-editing (fall back to raw stdin)")
+	oneShot := flag.Bool("p", false, "one-shot print mode: read ALL of stdin as a single prompt, run one turn (tools allowed), print, exit — the claude -p convention. Without -p, piped stdin is one turn PER LINE.")
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
 	castle := flag.String("castle", "", "write the live session to this file each turn (feeds the block-world UI)")
 	brood := flag.Int("brood", 0, "seconds idle before auto-checking peer mailbox (0=off)")
@@ -237,7 +238,7 @@ func main() {
 		flashModel: flashModel, proModel: proModel, router: routerOn,
 		mcp: mcp, bridges: bridges, castleFile: *castle, tools: tools, maxSteps: *maxSteps,
 		showThinking: *showThinking, autoYes: *autoYes, lean: *lean, logPath: *logPath,
-		noReadline: *noReadline, daemon: *daemon,
+		noReadline: *noReadline, daemon: *daemon, oneShot: *oneShot,
 		msgs: msgs,
 	}
 	sess.pid = os.Getpid()
@@ -284,6 +285,7 @@ type session struct {
 	interactive  bool
 	in           *bufio.Reader
 	noReadline   bool              // disable readline even when interactive
+	oneShot      bool              // -p: whole stdin = one prompt, one turn, exit
 	daemon       bool              // headless mode: no readline, poll-act-sleep loop
 	name         string            // pilot identity in the castle + REPL prompt
 	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
@@ -388,6 +390,24 @@ func (s *session) broodLoop() {
 
 func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
+	// -p (one-shot print mode): the whole of stdin is ONE prompt, one turn, exit.
+	// This is the claude -p convention. Three independent callers (pilot-p-loop.sh,
+	// kosaten's delegate at internal/mcp/delegate.go, the .anthro scripts' idiom)
+	// all reached for `pilot -p` before it existed — each filled the interface gap
+	// with the same coherent model (the anthropologist's inversion law, 2026-07-12).
+	// Rather than repair every caller to the quirky line-per-turn pipe contract,
+	// this makes their shared model true.
+	if s.oneShot {
+		s.interactive = false
+		all, _ := io.ReadAll(os.Stdin)
+		prompt := strings.TrimSpace(string(all))
+		if prompt == "" {
+			fmt.Fprintln(os.Stderr, "pilot -p: empty prompt on stdin")
+			os.Exit(2)
+		}
+		s.turn(prompt)
+		return
+	}
 	// Catch Ctrl+C during model thinking: cancel the API call,
 	// keep the user's input, and return to the prompt for editing.
 	// Also kill any running subprocess (run_command), process group
