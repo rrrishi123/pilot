@@ -530,9 +530,13 @@ func (w *world) watchHealth() {
 func (w *world) worldJSON() []byte {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	rooms := make([]wireRoom, len(w.rooms))
+	// Lean rooms: the renderer draws a hut from position + shows the Name label; it
+	// never reads the room's User/Answer TEXT (that's the room's memory — ~380 chars
+	// each × 23k rooms = ~4MB of conversation the game never draws). Ship name+x+y only;
+	// the full text stays in the jsonl, served on demand if ever needed.
+	rooms := make([]map[string]any, len(w.rooms))
 	for i, r := range w.rooms {
-		rooms[i] = wireRoom{Name: r.Name, U: clip(r.User, 160), A: clip(r.Answer, 220), X: w.pos[i].X, Y: w.pos[i].Y}
+		rooms[i] = map[string]any{"n": r.Name, "x": w.pos[i].X, "y": w.pos[i].Y}
 	}
 	var doors []wireDoor
 	for i, ds := range w.doors {
@@ -542,10 +546,44 @@ func (w *world) worldJSON() []byte {
 			}
 		}
 	}
+	// SNAPSHOT, not the whole log. The edit-log is the world's MEMORY — append-only,
+	// every hand's action kept, nothing deleted (the file-believed contract). But a
+	// renderer needs PERCEPTION, not memory: the CURRENT block at each position, once.
+	// Shipping all N edits (80k+, 75% dead overwrites) made every tab replay the whole
+	// history to see the present — the load-time wall. So we fold the log to current
+	// state here: distinct positions only, [x,y,b] triples (no author field — the
+	// client reads only x/y/b; `who` lives on in the log and on live SSE edits for the
+	// census). ~4x fewer entries, ~10x smaller payload, same client code. Memory and
+	// sight are different organs; the full log stays on disk and in w.edits untouched.
+	cur := make(map[[2]int]int, len(w.edits))
+	for _, e := range w.edits {
+		x, _ := e["x"].(int)
+		y, _ := e["y"].(int)
+		b, _ := e["b"].(int)
+		// edits round-trip through JSON as float64 when reloaded from disk
+		if fx, ok := e["x"].(float64); ok {
+			x = int(fx)
+		}
+		if fy, ok := e["y"].(float64); ok {
+			y = int(fy)
+		}
+		if fb, ok := e["b"].(float64); ok {
+			b = int(fb)
+		}
+		cur[[2]int{x, y}] = b
+	}
+	// Same "edits" key + same {x,y,b} object shape the client already reads (it uses
+	// only e.x/e.y/e.b, never e.who), so this is a pure server optimization — no page
+	// change, no collision. Deduped to current state: ~20k live tiles instead of ~80k
+	// log entries, and no author field.
+	snapshot := make([]map[string]int, 0, len(cur))
+	for pos, blk := range cur {
+		snapshot = append(snapshot, map[string]int{"x": pos[0], "y": pos[1], "b": blk})
+	}
 	b, _ := json.Marshal(map[string]any{
 		"rooms": rooms, "doors": doors, "presence": w.presence,
 		"comic": w.comic, "health": w.health, "houses": w.houses,
-		"seed": w.seed, "edits": w.edits,
+		"seed": w.seed, "edits": snapshot,
 		"homes": w.homes, "zones": w.zones, "agentPos": w.agentPos,
 	})
 	return b

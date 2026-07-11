@@ -754,7 +754,23 @@ func (g *pilotGopher) thinkAndAct(brain *deepseekBrain, sys, userMsg string) {
 	cycleProductive := false
 	for iter := 0; iter < 3; iter++ {
 		resp := brain.thinkWithTools(sys, g.history)
-		if resp == nil { return }
+		if resp == nil {
+			// Empty brain response (DeepSeek overloaded/erroring). The user prompt
+			// for THIS turn was already appended by the caller; leaving it orphaned
+			// is the wedge — every failed idle-nudge stacked one, and after ~20 the
+			// gopher was buried in un-answered prompts (the recurring re-wedge,
+			// 2026-07-11). Pop the orphaned prompt so history stays clean, and back
+			// off a beat so we don't hammer a failing brain. When it recovers, the
+			// gopher resumes from a clean state instead of a 20-deep idle stack.
+			if iter == 0 && len(g.history) > 0 {
+				last := g.history[len(g.history)-1]
+				if r, _ := last["role"].(string); r == "user" {
+					g.history = g.history[:len(g.history)-1]
+				}
+			}
+			time.Sleep(3 * time.Second)
+			return
+		}
 		if len(resp.ToolCalls) > 0 {
 			am := map[string]any{"role":"assistant"}
 			if resp.Content != "" { am["content"] = resp.Content }
