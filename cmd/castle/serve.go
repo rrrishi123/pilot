@@ -681,7 +681,7 @@ func runServe(addr, path string) {
 			http.Error(rw, "bad edit", 400)
 			return
 		}
-		rec := map[string]any{"x": e.X, "y": e.Y, "b": e.B}
+		rec := map[string]any{"x": e.X, "y": e.Y, "b": e.B, "who": e.Who}
 		w.mu.Lock()
 		w.edits = append(w.edits, rec)
 		w.mu.Unlock()
@@ -689,7 +689,7 @@ func runServe(addr, path string) {
 			json.NewEncoder(f).Encode(rec)
 			f.Close()
 		}
-		w.broadcast(map[string]any{"type": "edit", "x": e.X, "y": e.Y, "b": e.B})
+		w.broadcast(map[string]any{"type": "edit", "x": e.X, "y": e.Y, "b": e.B, "who": e.Who})
 		rw.WriteHeader(204)
 	})
 	// /pos — a player's live position. Ephemeral (not persisted); broadcast so

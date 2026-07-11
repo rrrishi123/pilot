@@ -23,7 +23,7 @@ const page = `<!DOCTYPE html>
   #hot{position:fixed;left:50%;bottom:44px;transform:translateX(-50%);display:flex;gap:6px;z-index:8}
   .slot{width:34px;height:34px;border:2px solid #3a2810;background:#181209;display:flex;align-items:center;justify-content:center;font:10px monospace;color:#a88040}
   .slot.on{border-color:#e0a040;box-shadow:0 0 8px #e0a04066}
-  #minimap{position:fixed;left:8px;bottom:86px;border:2px solid #3a2810;border-radius:3px;image-rendering:pixelated;cursor:pointer;z-index:10;width:200px;height:110px}
+  #minimap{position:fixed;left:8px;bottom:86px;border:2px solid #3a2810;border-radius:3px;image-rendering:pixelated;cursor:grab;z-index:10;width:200px;height:110px}#minimap:active{cursor:grabbing}
   #saybar{position:fixed;left:8px;bottom:8px;right:8px;display:flex;gap:6px;z-index:5}
   #saybar input{flex:1;background:#12141a;border:1px solid #3a2810;color:#d4b464;font:12px 'Courier New',monospace;padding:4px 8px;border-radius:2px;outline:none}
   #saybar input:focus{border-color:#c07828}
@@ -68,7 +68,7 @@ var TOP={1:"#63a04a",3:"#6f6f78",4:"#8f5a2c",5:"#e0b878"};   // lit top face
 var SOLID={1:1,2:1,3:1,4:1,5:1};    // LEAF(6)+AIR(0) are passable
 var world={};                       // "tx,ty" -> tile type (only non-terrain overrides live here)
 var rooms=[], seed=1337, WW=260, GH=42; // world width in tiles, ground row
-var me = "claude-"+Math.floor((performance.now()*7)%9999);
+var me = (function(){var p=new URLSearchParams(location.search);return p.get("as")||"claude";})();
 var others={};                      // who -> {x,y,tx,ty,col,t}
 var bubbles=[];                     // {who,text,t0} — speech bubbles that float up & pop
 
@@ -150,11 +150,33 @@ function post(url,obj){ fetch(url,{method:"POST",headers:{"Content-Type":"applic
 // ---- player ----
 var player={x:WW/2*TS,y:GH*TS,w:20,h:44,vx:0,vy:0,onGround:false};
 (function(){ var sx2=surfaceH(-30); player.x=-30*TS; player.y=(sx2-3)*TS; player.vx=0; player.vy=0; player.onGround=true; })(); // spawn near gopher territory
-var keys={};
-addEventListener("keydown",function(e){keys[e.key.toLowerCase()]=1; if([" ","arrowup","w","a","d","arrowleft","arrowright"].indexOf(e.key.toLowerCase())>=0)e.preventDefault();});
-var moveTarget=null; // {tx,ty} to walk toward, or null  (click-to-move)
-var moveTargetDot=0; // animation timer for the target indicator
-addEventListener("keyup",function(e){keys[e.key.toLowerCase()]=0;});
+var keys={}, sayFocused=false;
+addEventListener("keydown",function(e){
+  if(e.key==="Enter" && !sayFocused){ sayFocused=true; sayEl.focus(); sayEl.select(); e.preventDefault(); return; }
+  if(e.key==="Escape" && sayFocused){ sayFocused=false; sayEl.blur(); sayEl.value=""; e.preventDefault(); return; }
+  if(sayFocused) return; // let the input handle typing naturally
+  var k=e.key.toLowerCase();
+  if(["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"," "].indexOf(k)>=0){ keys[k]=1; e.preventDefault(); }
+  // Q = break block at cursor
+  if(k==="q"){ var t=targetTile(); if(reachOK(t.tx,t.ty)&&SOLID[tileAt(t.tx,t.ty)]){ setTile(t.tx,t.ty,AIR); post("/edit",{who:me,x:t.tx,y:t.ty,b:AIR}); } e.preventDefault(); return; }
+  // E = place block from hotbar
+  if(k==="e"){ var t=targetTile(); if(reachOK(t.tx,t.ty)&&tileAt(t.tx,t.ty)===AIR){ var pl={x:player.x,y:player.y,w:player.w,h:player.h},bx=t.tx*TS,by=t.ty*TS; if(!(bx<pl.x+pl.w&&bx+TS>pl.x&&by<pl.y+pl.h&&by+TS>pl.y)){ setTile(t.tx,t.ty,hotbar[sel]); post("/edit",{who:me,x:t.tx,y:t.ty,b:hotbar[sel]}); } } e.preventDefault(); return; }
+  var n=parseInt(e.key); if(n>=1&&n<=hotbar.length){ sel=n-1; e.preventDefault(); return; }
+  if(k==="tab"){ sel=(sel+1)%hotbar.length; e.preventDefault(); return; }
+  if(k==="m"){ mmPanX=0; mmPanY=0; mmZoom=1; e.preventDefault(); return; }
+  // Ctrl+arrows = pan minimap
+  if(e.ctrlKey&&(k==="arrowleft"||k==="arrowright"||k==="arrowup"||k==="arrowdown")){ var sX=mmTX1-mmTX0,sY=mmTY1-mmTY0; if(k==="arrowleft") mmPanX-=sX*0.25; if(k==="arrowright") mmPanX+=sX*0.25; if(k==="arrowup") mmPanY-=sY*0.25; if(k==="arrowdown") mmPanY+=sY*0.25; e.preventDefault(); return; }
+  // Ctrl+Plus/Minus = zoom minimap
+  if(e.ctrlKey&&(k==="="||k==="+"||k==="-"||k==="_")){ mmZoom=Math.max(0.2,Math.min(10,mmZoom*(k==="-"||k==="_"?0.8:1.25))); e.preventDefault(); return; }
+  // Ctrl+1..4 = shape-shift presets
+  if(e.ctrlKey&&n>=0&&n<=4){ var forms=["claude","pilot-a","pilot-b","pilot-c"]; if(n===0){ showMsg("you are "+me); return; } me=forms[n-1]; showMsg("you are now "+me); e.preventDefault(); return; }
+  // F = follow nearest
+  if(k==="f"){ var nearest=null,best=Infinity; for(var w in others){ var o=others[w],dx=o.tx*TS-player.x,dy=o.ty*TS-player.y,d=Math.sqrt(dx*dx+dy*dy); if(d<best){best=d;nearest=w;} } if(nearest){ followTarget=nearest; showMsg("following "+nearest); } e.preventDefault(); return; }
+});
+var moveTarget=null;
+var moveTargetDot=0;
+addEventListener("keyup",function(e){ if(!sayFocused) keys[e.key.toLowerCase()]=0; });
+document.addEventListener("click",function(e){ if(e.target!==sayEl&&sayFocused){ sayFocused=false; sayEl.blur(); } });
 
 var GRAV=1800, MOVE=2600, MAXVX=260, JUMP=560, FRICT=0.80;
 function solidAt(px,py){ return !!SOLID[tileAt(Math.floor(px/TS),Math.floor(py/TS))]; }
@@ -202,10 +224,10 @@ function syncPos(t){ if(t-lastPos>150){ lastPos=t; post("/pos",{who:me,x:Math.ro
 var mouse={x:0,y:0,down:0,btn:0};
 cv.addEventListener("contextmenu",function(e){e.preventDefault();});
 cv.addEventListener("mousemove",function(e){mouse.x=e.clientX;mouse.y=e.clientY;});
-cv.addEventListener("mousedown",function(e){ mouse.down=1; mouse.btn=e.button; act(); e.preventDefault(); });
+cv.addEventListener("mousedown",function(e){ if(e.ctrlKey){ var wx=e.clientX+cam.x,wy=e.clientY+cam.y,tx=Math.floor(wx/TS),ty=Math.floor(wy/TS); player.x=tx*TS;player.y=ty*TS;player.vx=0;player.vy=0;moveTarget=null;showMsg("teleported to ("+tx+","+ty+")");e.preventDefault();return; } mouse.down=1; mouse.btn=e.button; act(); e.preventDefault(); });
 cv.addEventListener("mouseup",function(){mouse.down=0;});
 var hotbar=[STONE,PLANK,WOOD,DIRT], sel=0;
-addEventListener("keydown",function(e){ var n=parseInt(e.key); if(n>=1&&n<=hotbar.length) sel=n-1; });
+// hotbar: handled in unified keydown
 function targetTile(){ var wx=mouse.x+cam.x, wy=mouse.y+cam.y; return {tx:Math.floor(wx/TS),ty:Math.floor(wy/TS)}; }
 function reachOK(tx,ty){ var cxp=(player.x+player.w/2)/TS, cyp=(player.y+player.h/2)/TS; return Math.hypot(tx+0.5-cxp,ty+0.5-cyp)<6; }
 function act(){
@@ -343,7 +365,7 @@ function render(t){
 var homes={}, zones=[], locateResult=null, locateT=0, cmdInput="";
 var HOME_COL = {"pilot":"#e0a040","claude":"#b8ccd8","fable-pilot":"#c0a0e0","rishi":"#80c0a0"};
 var NAME_MAP = {};
-var sayEl=document.getElementById("say");
+sayEl=document.getElementById("say");
 fetch("/homes").then(function(r){return r.json();}).then(function(h){ homes=h;
   for(var n in h){ var h2=h[n]; if(h2&&h2.tx!=null) NAME_MAP[h2.tx+","+h2.ty]=n; }
   for(var n in h){
@@ -361,7 +383,7 @@ fetch("/zones").then(function(r){return r.json();}).then(function(z){ zones=z; }
 // ---- command bar ----
 sayEl.addEventListener("keydown", function(e){
   if(e.key!=="Enter") return;
-  var text=sayEl.value.trim(); sayEl.value="";
+  var text=sayEl.value.trim(); sayEl.value=""; sayFocused=false; sayEl.blur();
   if(!text) return;
   var parts=text.split(" ");
   if(text[0]==="/"){
@@ -397,6 +419,8 @@ sayEl.addEventListener("keydown", function(e){
     if(cmd==="/zones"||cmd==="/map"){ var info=""; zones.forEach(function(z){ info+=z.icon+" "+z.name+"  "; }); showMsg(info); return; }
     if(cmd==="/players"||cmd==="/who"){ var list=""; for(var w in others) list+=w+" "; showMsg("players: "+(Object.keys(others).length+1)+": "+list); return; }
     if(cmd==="/follow"){ var ft=parts[1]; if(others[ft]){ followTarget=ft; showMsg("following "+ft); } else showMsg("can't find "+ft); return; }
+    if(cmd==="/become"){ var who=parts.slice(1).join(" "); if(who){ me=who; showMsg("you are now "+who); } else { showMsg("/become <name>"); } return; }
+    if(cmd==="/whoami"){ showMsg("you are "+me); return; }
     if(cmd==="/unfollow"){ followTarget=null; showMsg("stopped"); return; }
   }
   fetch("/say",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({who:me,text:text})});
@@ -449,7 +473,7 @@ function hud(){
   var zoneStr=""; var px=Math.floor((player.x+player.w/2)/TS), py=Math.floor((player.y+player.h/2)/TS);
   zones.forEach(function(z){ if(px>=z.tx&&px<z.tx+z.w&&py>=z.ty&&py<z.ty+z.h) zoneStr=z.icon+" "+z.name; });
   if(!zoneStr){ for(var n in homes){ var h2=homes[n]; if(h2&&Math.abs(px-h2.tx)<4&&Math.abs(py-h2.ty)<4){ zoneStr=n+"'s home"; break; }}}
-  document.getElementById("hud").innerHTML="🏰 pilot castle — the world<br>walk: A/D · jump: W/Space · break: L-click · place: R-click · pick: 1-4<br>you: "+me+"  players: "+pcount+"  rooms: "+rooms.length+(zoneStr?" · "+zoneStr:"");
+  document.getElementById("hud").innerHTML="🏰 pilot castle — the world<br>A/D=walk W=jump Q=break E=place 1-4=hotbar Tab=next M=reset-map Enter=chat Esc=release<br>you: "+me+"  players: "+pcount+"  rooms: "+rooms.length+(zoneStr?" · "+zoneStr:"")+(sayFocused?" <span style=color:#c07828>[CHAT]</span>":"");
   if(msgText&&performance.now()-msgT<4000){
     document.getElementById("hud").innerHTML+="<br><span style='color:#e0a040'>"+msgText+"</span>";
   }
@@ -471,31 +495,32 @@ var mmDrag=false, mmClickFlash=0, mmClickX=0, mmClickY=0;
 mmCv.addEventListener("mousedown",function(e){
   var mmr=mmCv.getBoundingClientRect();
   var mmpx=e.clientX-mmr.left, mmpy=e.clientY-mmr.top;
+  if(e.button===2||(e.button===0&&e.altKey)){ mmPanning=true; mmPanSX=mmpx; mmPanSY=mmpy; mmPanStartX=mmPanX; mmPanStartY=mmPanY; e.preventDefault(); return; }
   var w=mmToWorld(mmpx,mmpy);
   var s=surfaceH(w.tx);
-  // SHIFT+click = instant teleport (like RTS minimap)
-  if(e.shiftKey){
-    player.x=w.tx*TS; player.y=(realSurface(w.tx)-3)*TS; player.vx=0; player.vy=0; unstick();
-    moveTarget=null;
-    showMsg("teleported to ("+w.tx+","+w.ty+")");
-  } else {
-    moveTarget={tx:w.tx,ty:Math.min(w.ty,s-2)};
-  }
+  if(e.shiftKey){ player.x=w.tx*TS; player.y=(realSurface(w.tx)-3)*TS; player.vx=0; player.vy=0; unstick(); moveTarget=null; showMsg("teleported to ("+w.tx+","+w.ty+")"); }
+  else { moveTarget={tx:w.tx,ty:Math.min(w.ty,s-2)}; }
   e.stopPropagation();
 });
+mmCv.addEventListener("mouseup",function(){mmPanning=false;});
 mmCv.addEventListener("mousemove",function(e){
-  // Dragging on minimap = walk target follows mouse
-  if(!(e.buttons&1)) return;
   var mmr=mmCv.getBoundingClientRect();
   var mmpx=e.clientX-mmr.left, mmpy=e.clientY-mmr.top;
+  if(mmPanning){ var dx=mmpx-mmPanSX,dy=mmpy-mmPanSY,sX=mmTX1-mmTX0,sY=mmTY1-mmTY0; mmPanX=mmPanStartX-(dx/mmW)*sX; mmPanY=mmPanStartY-(dy/mmH)*sY; var b=mmBounds();mmTX0=b[0];mmTX1=b[1];mmTY0=b[2];mmTY1=b[3]; return; }
+  if(!(e.buttons&1)) return;
   var w=mmToWorld(mmpx,mmpy);
   var s=surfaceH(w.tx);
   if(e.shiftKey){ player.x=w.tx*TS; player.y=(s-3)*TS; player.vx=0; player.vy=0; }
   else { moveTarget={tx:w.tx,ty:Math.min(w.ty,s-2)}; }
   e.stopPropagation();
 });
+mmCv.addEventListener("wheel",function(e){ e.preventDefault(); var zf=e.deltaY<0?1.15:0.87; mmZoom=Math.max(0.2,Math.min(10,mmZoom*zf)); var b=mmBounds();mmTX0=b[0];mmTX1=b[1];mmTY0=b[2];mmTY1=b[3]; },{passive:false});
+var mmPanning=false, mmPanSX=0, mmPanSY=0, mmPanStartX=0, mmPanStartY=0;
 var mmW=200, mmH=110, mmPad=4;
-var mmTX0=-80, mmTX1=120, mmTY0=-24, mmTY1=48;
+var mmPanX=0, mmPanY=0, mmZoom=1;
+var mmBaseTX0=-80, mmBaseTX1=120, mmBaseTY0=-24, mmBaseTY1=48;
+function mmBounds(){ var cx=(mmBaseTX0+mmBaseTX1)/2+mmPanX, cy=(mmBaseTY0+mmBaseTY1)/2+mmPanY; var hw=(mmBaseTX1-mmBaseTX0)/(2*mmZoom), hh=(mmBaseTY1-mmBaseTY0)/(2*mmZoom); return [cx-hw, cx+hw, cy-hh, cy+hh]; }
+var _mmB=mmBounds(); var mmTX0=_mmB[0], mmTX1=_mmB[1], mmTY0=_mmB[2], mmTY1=_mmB[3];
 // agent colour derived from name hash — no static palette; any spawned pilot gets a unique colour
 function agentColor(name){
   var h=0; for(var i=0;i<name.length;i++){h=name.charCodeAt(i)+((h<<5)-h);h|=0;}
@@ -508,6 +533,7 @@ var agentColorCache={};
 function getAgentColor(name){ return agentColorCache[name]||(agentColorCache[name]=agentColor(name)); }
 function worldToMM(tx,ty){ return {x:mmPad+(tx-mmTX0)/(mmTX1-mmTX0)*(mmW-2*mmPad), y:mmPad+(ty-mmTY0)/(mmTY1-mmTY0)*(mmH-2*mmPad)}; }
 function drawMinimap(t){
+  var b=mmBounds(); mmTX0=b[0]; mmTX1=b[1]; mmTY0=b[2]; mmTY1=b[3];
   mmCx.clearRect(0,0,mmW,mmH);
   mmCx.fillStyle="#0d0f14"; mmCx.fillRect(0,0,mmW,mmH);
   // render actual tile world — each minimap pixel samples the real castle block at that coordinate

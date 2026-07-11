@@ -634,6 +634,18 @@ func (g *pilotGopher) loadHistory() {
 	if g.historyPath == "" { return }
 	data, _ := os.ReadFile(g.historyPath)
 	json.Unmarshal(data, &g.history)
+	g.cleanOrphanTools()
+}
+
+// cleanOrphanTools drops any tool message whose tool_call_id no longer has a
+// live assistant parent in the history — the referential sweep. A tool message
+// whose parent was cut (by truncation or a partial load) is an orphan the
+// DeepSeek API rejects wholesale: the gopher wedges, uploading its frozen
+// history every minute and getting refused every time (orphan@[1], witnessed
+// 9h on 2026-07-11/12). Called at load AND inside truncation — and in the
+// truncation path it must run BEFORE any prepend, or the orphan hides at [1]
+// behind the prepended context marker where a head-only check can't see it.
+func (g *pilotGopher) cleanOrphanTools() {
 	activeIDs := map[string]bool{}
 	for _, m := range g.history {
 		if m["role"] == "assistant" {
@@ -762,7 +774,13 @@ func (g *pilotGopher) thinkAndAct(brain *deepseekBrain, sys, userMsg string) {
 		keep := 60
 		if keep > len(g.history) { keep = len(g.history) }
 		g.history = g.history[len(g.history)-keep:]
-		// Ensure we start with a user message for context
+		// ORDER MATTERS (the orphan@[1] wedge, 2026-07-12): sweep orphaned tool
+		// messages FIRST — the cut can sever a tool msg from its assistant parent
+		// anywhere in the window, and if we prepend before sweeping, the orphan
+		// hides at [1] behind the context marker where the old head-only check
+		// never saw it. Referential sweep (cleanOrphanTools), THEN ensure the
+		// window opens with a user message.
+		g.cleanOrphanTools()
 		if len(g.history) > 0 {
 			role, _ := g.history[0]["role"].(string)
 			if role != "user" && role != "system" {
