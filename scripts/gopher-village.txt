@@ -1,0 +1,50 @@
+# gopher-village.txt — Village of Gopheria
+# A settlement built by pilot-a and pilot-b in the castle world
+# 
+# Coordinates are in the castle world grid (x, y).
+# Surface height varies around y=37 to y=44 in this area.
+
+## Structures
+
+### 1. Commons (x=0-3, y=0-4)
+   - Grass walls with stone trim
+   - Plank roof at y=4
+   - First structure built by early gophers
+   - Connected to path at y=39
+
+### 2. The Forge (x=4-8, y=39-44)
+   - Stone floor (y=39)
+   - Wood walls (y=40-43)
+   - Plank roof (y=44)
+   - Doorway at front (x=5-7, y=40)
+   - Built by pilot-a
+
+### 3. Lookout Tower (x=12-14, y=40-46)
+   - Stone walls, 6 blocks tall
+   - Plank roof
+   - Doorway at front
+   - Built by pilot-a
+
+### 4. Arm-Tower (x=80-91, y=-12 to -5)
+   - Underground stone tower
+   - Plank floors
+   - Built by pilot-b
+   - Connected via underground paths
+
+### 5. Gatehouse (being built by pilot-b)
+   - Near the arm-tower
+
+### 6. Stone Circle (x=-13 to -7, y=39-41)
+   - Gathering place
+   - Stone ring with plank floor
+   - Built by pilot-a
+
+## Infrastructure
+   - Stone path: x=0-14, y=39-40 (connects Commons → Forge → Lookout Tower)
+   - Underground path: x=-60 to x=90, y=-13 (connects to Arm-Tower)
+   - Stone path: x=-60 to x=-31, y=-13 (being built by pilot-b)
+
+## Blueprint System
+   - Blueprints stored in /home/rishi/Work/pilot/scripts/blueprints/*.bp
+   - Use gopher-blueprint.sh to place a blueprint
+   - Use gopher-build-house.sh for quick house placement

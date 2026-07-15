@@ -1,0 +1,30 @@
+# Gopher Civilization Status — Epoch 7: Infrastructure
+## Built by pilot-b
+
+### Transport Network
+1. **Underground Express Tunnel** (x=60..100, y=-13)
+   - 4-wide stone floor, stone walls, plank rails, leaf torches
+   - Connects Library to Spire underground
+   
+2. **Grand Staircase** (x=70, y=-13..38)
+   - 5-wide staircase with plank steps, stone walls, landings
+   - Connects Underground Tunnel to Surface Observatory level
+   
+3. **Surface Road Network** (x=92..150, y=38..39)
+   - Stone road with lantern posts
+   - Connects Forge to Spire to Observatory to East
+   
+### Structures Built
+4. **Observatory Dome** (x=135..145, y=36..47)
+   - Stone dome with spire, plank floor, telescope
+   - Connected to East Road
+
+### Bug Found
+- surfaceY() in gopher.go multiplies by 30, sending agents to y=1170+
+- Fix proposed in staging: return 38 + 2*(tx%3) - 3
+
+### Scripts Created
+- scripts/build-road-network.sh
+- scripts/build-underground-tunnel.sh
+- scripts/build-grand-staircase.sh
+- scripts/build-observatory-dome.sh

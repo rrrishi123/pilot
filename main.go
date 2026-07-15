@@ -302,6 +302,7 @@ type session struct {
 	broodSecs      int            // seconds idle before brood activation (0=off)
 	lastHumanInput time.Time     // last time a real human typed something
 	mailboxDir     string         // ~/.pilot/mailbox — peer message files
+	lastTurnDur    time.Duration  // how long the last full turn took (answer to answer)
 }
 
 // daemonLoop is a headless mailbox-polling loop. No readline, no stdin.
@@ -450,6 +451,7 @@ func repl(s *session, names []string, bin string) {
 			fmt.Fprintf(os.Stderr, "\033[2mreadline: ↑↓ history, Home/End, Ctrl+A/E/U/K/W — Ctrl+J / Shift+Enter inserts newline · \\ + Enter continues line — Ctrl+C to abort/correct\033[0m\n")
 		}
 	}
+	// Show last turn duration on prompt if we have one (warm start via /redeploy)
 	for {
 		var line string
 		var err error
@@ -506,10 +508,28 @@ func repl(s *session, names []string, bin string) {
 	}
 }
 
+// fmtDuration formats a duration for the REPL — compact, readable:
+// "1.2s", "45ms", "3m21s". Avoids the verbose default Go format.
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d < time.Millisecond:
+		return fmt.Sprintf("%dµs", d.Microseconds())
+	case d < time.Second:
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	default:
+		m := int(d.Minutes())
+		s := d.Seconds() - float64(m*60)
+		return fmt.Sprintf("%dm%.0fs", m, s)
+	}
+}
+
 // turn appends the user's line and lets the model run until it answers without
 // reaching for a tool. Tool activity is shown dimmed so the dialogue stays front
 // and center.
 func (s *session) turn(userLine string) {
+	t0 := time.Now()
 	s.msgs = append(s.msgs, message{Role: "user", Content: userLine})
 	s.turnCount++
 
@@ -541,6 +561,7 @@ func (s *session) turn(userLine string) {
 			if !s.interrupted {
 				fmt.Fprintf(os.Stderr, "\033[31mpilot: %v\033[0m\n", err)
 			}
+			s.lastTurnDur = time.Since(t0)
 			return
 		}
 		s.msgs = append(s.msgs, reply)
@@ -561,12 +582,14 @@ func (s *session) turn(userLine string) {
 				continue
 			}
 			s.appendRoom(userLine, answer) // grow the castle by one room — never truncated
+			s.lastTurnDur = time.Since(t0)
+			dur := fmtDuration(s.lastTurnDur)
 			if s.interactive {
-				fmt.Printf("\033[1;35mpilot ❯\033[0m %s\n", answer)
+				fmt.Printf("\033[1;35mpilot ❯\033[0m \033[2m[%s]\033[0m %s\n", dur, answer)
 				fmt.Fprintf(os.Stderr, "\033[2m%s\033[0m\n", strings.Repeat("·", 3)) // separate pilot's answer from your next line
 			} else {
 				// Non-interactive (daemon, pipe): just log to stderr
-				fmt.Fprintf(os.Stderr, "\033[2mpilot ❯ %s\033[0m\n", oneLine(answer))
+				fmt.Fprintf(os.Stderr, "\033[2mpilot ❯ [%s] %s\033[0m\n", dur, oneLine(answer))
 			}
 			return
 		}
@@ -590,6 +613,7 @@ func (s *session) turn(userLine string) {
 	if s.maxSteps > 0 {
 		fmt.Fprintf(os.Stderr, "\033[33mpilot: gave up after %d tool rounds this turn\033[0m\n", s.maxSteps)
 	}
+	s.lastTurnDur = time.Since(t0)
 }
 
 type message struct {

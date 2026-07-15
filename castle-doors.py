@@ -1,136 +1,151 @@
 #!/usr/bin/env python3
-# castle-doors.py v3 — use the brain to find the doors.
-# DeepSeek flash judges which rooms share a semantic thread.
-# One API call for all pairs — cheap, reliable, no embeddings.
-import json, os, sys, urllib.request
+# castle-doors.py — daemon: watches the castle for new rooms, generates
+# semantic doors (connections) between rooms that share a concern.
+# Runs continuously — every new batch of rooms gets linked.
+import json, os, sys, time, urllib.request
 
 CASTLE = "/home/rishi/.pilot-castle.jsonl"
-DOORS = "/home/rishi/.pilot-doors.jsonl"
+DOORS  = "/home/rishi/.pilot-doors.jsonl"
 API_URL = "https://api.deepseek.com/chat/completions"
+INTERVAL = 30  # seconds between checks
+CONTEXT_WINDOW = 20  # recent rooms sent as context for new doors
 
-def get_api_key():
+def api_key():
     k = os.environ.get("DEEPSEEK_API_KEY", "")
-    if k:
-        return k
-    # Try kosaten .env
-    envf = "/home/rishi/Work/kosaten/.env"
-    if os.path.exists(envf):
-        with open(envf) as f:
-            for line in f:
-                if line.startswith("DEEPSEEK_API_KEY="):
-                    return line.strip().split("=", 1)[1]
+    if k: return k
+    for p in [f"{os.environ['HOME']}/Work/kosaten/.env",
+              f"{os.environ['HOME']}/.pilot.env"]:
+        if os.path.exists(p):
+            with open(p) as f:
+                for line in f:
+                    if line.startswith("DEEPSEEK_API_KEY="):
+                        return line.strip().split("=", 1)[1]
     return ""
 
-def main():
-    api_key = get_api_key()
-    if not api_key:
-        print("castle-doors: DEEPSEEK_API_KEY not found")
-        return
-
-    with open(CASTLE) as f:
-        rooms = [json.loads(line) for line in f if line.strip()]
+def load_rooms(path):
+    rooms = []
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rooms.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
     for i, r in enumerate(rooms):
         r["_id"] = i
+    return rooms
 
-    if len(rooms) < 2:
-        print(f"castle-doors: {len(rooms)} rooms — need at least 2")
-        return
+def load_doors(path):
+    """Return set of (from,to) pairs already connected."""
+    seen = set()
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        d = json.loads(line)
+                        seen.add((d["from"], d["to"]))
+                        seen.add((d["to"], d["from"]))
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+    return seen
 
+def find_doors(key, rooms, start_idx):
+    """Ask DeepSeek to find doors between rooms[start_idx:] and the full set.
+    Returns list of {from,to,weight,thread} dicts."""
+    recent = rooms[max(0, start_idx - CONTEXT_WINDOW):]
+    
     room_list = ""
-    for i, r in enumerate(rooms):
-        q = r["user"][:120]
-        a = r["answer"][:150]
-        room_list += f"[{i}] Q: {q}\n    A: {a}\n\n"
+    for r in recent:
+        q = r["user"][:100].replace("\n", " ")
+        a = r["answer"][:100].replace("\n", " ")
+        room_list += f"[{r['_id']}] Q: {q}\n    A: {a}\n\n"
 
-    prompt = f"""Below are {len(rooms)} conversation turns in a castle. Each turn is a room.
+    prompt = f"""Below are {len(recent)} turns from one conversation. Each turn is a room in a castle.
 
 {room_list}
-Find all pairs of rooms that share a SEMANTIC thread — same topic, same concept, same concern, even if they use completely different words. Include:
-- Rooms about identity, memory, or the self
-- Rooms about Minecraft, block-worlds, games, or interfaces
-- Rooms about tools, capabilities, code, or the wire
-- Rooms about Excalidraw, drawing, or the board
-- Rooms about Firefox, browsers, or tabs
+Rooms that touch the same concern — even across time, even in different words — are connected. Find doors between NEW rooms [{start_idx}..{len(recent)+start_idx-1}] and any room.
 
-For each related pair, output a JSON object with "from", "to", "weight" (0.0-1.0), and "thread" (a short label like "minecraft-vision" or "identity-cold").
+Topics include: identity, pilots, self-modification, REPL, tools, code, the wire, castle, block-world, minimap, doors, presence, peers, kosaten, organism, heartbeats, streaming output.
 
-Output ONLY a JSON array, nothing else. Example: [{{"from":0,"to":3,"weight":0.85,"thread":"identity"}}]"""
+Output ONLY a JSON array of {{"from":N,"to":N,"weight":0.X,"thread":"label"}}.
+Doors must connect rooms that share a real concern. No frivolous connections."""
 
     body = json.dumps({
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 2000,
+        "temperature": 0, "max_tokens": 2000,
         "thinking": {"type": "disabled"},
     })
+    print(f"  → asking DeepSeek about {len(recent)} rooms…", flush=True)
     req = urllib.request.Request(API_URL, body.encode(),
-        {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+        {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
 
     try:
         resp = json.load(urllib.request.urlopen(req, timeout=60))
-        msg = resp["choices"][0]["message"]
-        content = msg.get("content", "") or msg.get("reasoning_content", "")
-
+        content = resp["choices"][0]["message"].get("content", "")
         if not content.strip():
-            print("castle-doors: empty model response")
-            print(f"  usage: {resp.get('usage', {})}")
-            return
-
-        # Parse JSON array
+            return []
         start = content.find("[")
         end = content.rfind("]")
-        if start >= 0 and end > start:
-            edges = json.loads(content[start:end+1])
-        else:
-            print("castle-doors: no JSON array in response")
-            print(f"  raw: {content[:800]}")
-            return
+        if start < 0 or end <= start:
+            return []
+        return json.loads(content[start:end+1])
+    except Exception as e:
+        print(f"  ✗ door query failed: {e}", flush=True)
+        return []
 
+def main():
+    key = api_key()
+    if not key:
+        print("castle-doors: no DEEPSEEK_API_KEY", flush=True)
+        sys.exit(1)
+
+    print(f"castle-doors: daemon started (interval={INTERVAL}s, watching {CASTLE})", flush=True)
+    last_count = 0
+
+    while True:
+        rooms = load_rooms(CASTLE)
+        existing_doors = load_doors(DOORS)
+
+        if len(rooms) <= last_count:
+            print(f"  · {len(rooms)} rooms, no new ones", flush=True)
+            time.sleep(INTERVAL)
+            continue
+
+        new_from = last_count
+        new_count = len(rooms) - last_count
+        print(f"\n  + {new_count} new rooms (total {len(rooms)})", flush=True)
+
+        edges = find_doors(key, rooms, new_from)
         valid = []
         for e in edges:
-            f, t = int(e.get("from", -1)), int(e.get("to", -1))
-            if 0 <= f < len(rooms) and 0 <= t < len(rooms) and f != t:
-                e["from_summary"] = rooms[f]["user"][:80]
-                e["to_summary"] = rooms[t]["user"][:80]
+            f = int(e.get("from", -1))
+            t = int(e.get("to", -1))
+            w = e.get("weight", 0)
+            if 0 <= f < len(rooms) and 0 <= t < len(rooms) and f != t and (f, t) not in existing_doors:
+                e["thread"] = e.get("thread", "connection")
                 valid.append(e)
 
         valid.sort(key=lambda e: e.get("weight", 0), reverse=True)
 
-        with open(DOORS, "w") as f:
-            for e in valid:
-                f.write(json.dumps(e) + "\n")
-
-        print(f"castle-doors v3: {len(rooms)} rooms → {len(valid)} semantic doors (model-judged)")
-        print(f"  via deepseek-v4-flash, {resp.get('usage',{}).get('total_tokens','?')} tokens\n")
-
-        for e in valid:
-            w = e.get("weight", 0)
-            thread = e.get("thread", "?")
-            arrow = "↔" if w > 0.8 else "→"
-            print(f"  [{e['from']}] {arrow} [{e['to']}]  w={w:.2f}  thread={thread}")
-            print(f"       from: {rooms[e['from']]['user'][:80]}")
-            print(f"       to:   {rooms[e['to']]['user'][:80]}\n")
-
-        degree = {}
-        for e in valid:
-            degree[e["from"]] = degree.get(e["from"], 0) + 1
-            degree[e["to"]] = degree.get(e["to"], 0) + 1
-
-        print("  room degrees:")
-        for i, r in enumerate(rooms):
-            d = degree.get(i, 0)
-            bar = "█" * d if d > 0 else "·"
-            print(f"    [{i}] {bar} deg={d}: {r['user'][:80]}")
-
-        orphans = [i for i in range(len(rooms)) if degree.get(i, 0) == 0]
-        if orphans:
-            print(f"\n  orphans (no doors): {orphans}")
+        if valid:
+            with open(DOORS, "a") as f:
+                for e in valid:
+                    f.write(json.dumps(e) + "\n")
+            print(f"  ✓ {len(valid)} new doors written to {DOORS}", flush=True)
+            for e in valid[:5]:
+                frm = rooms[e["from"]]["user"][:60].replace("\n"," ")
+                to  = rooms[e["to"]]["user"][:60].replace("\n"," ")
+                print(f"    [{e['from']}]↔[{e['to']}] w={e['weight']:.2f} {e['thread']}", flush=True)
         else:
-            print(f"\n  every room connected — no orphans")
+            print(f"  · no new doors found", flush=True)
 
-    except Exception as e:
-        print(f"castle-doors: API call failed: {e}")
-        import traceback; traceback.print_exc()
+        last_count = len(rooms)
+        time.sleep(INTERVAL)
 
 if __name__ == "__main__":
     main()
