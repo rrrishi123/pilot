@@ -1,2 +1,33 @@
-# built binary
-/pilot
+# Binaries
+pilot
+pilot-old
+pilot.old
+pilot-new
+castle
+castle-*
+castle.old
+castle.bak
+castle.v3.bak
+castle.pilot-b-build
+castle.pre-fix
+castle.latest
+castle-test
+castle-new
+*.bak
+*.old
+*.bak2
+*.v3.5-bak*
+*.v4-backup*
+*.patch
+cmd/castle/castle
+cmd/castle/gopher.go.bak*
+cmd/castle/serve.go.bak*
+cmd/castle/page.go.pre*
+cmd/castle/surfaceH.go
+
+# Data
+kosaten.db
+scripts/*.bp
+
+# OS
+.DS_Store
