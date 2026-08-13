@@ -40,7 +40,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
 )
 
 const defaultModel = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q4_K_M"
@@ -263,46 +262,46 @@ func main() {
 // ---- conversation ----
 
 type session struct {
-	base, model  string
-	provider     string // "deepseek" | "ollama"
-	apiKey       string // for the deepseek (OpenAI-compatible) provider
-	flashModel   string // deepseek router: the cheap/fast model
-	proModel     string // deepseek router: the strong/thinking model
-	router       bool   // choose flash vs pro per turn by task difficulty
-	turnModel    string // model chosen for the current turn
-	turnThinking bool   // whether to enable reasoning this turn
-	turnEffort   string // reasoning_effort when thinking
-	mcp          *mcpServer
-	bridges      map[string]bridge   // "<name>_" prefix -> bridged MCP (HTTP or stdio), config-driven
-	castleFile   string   // if set, dump the session here each turn for the block-world UI
-	tools        []map[string]any
-	turnTools    []map[string]any // tools offered this turn (scoped when lean)
-	maxSteps     int
-	showThinking bool
-	autoYes      bool
-	lean         bool // host-side curation: gate probe/channel tools behind intent
-	logPath      string
-	interactive  bool
-	in           *bufio.Reader
-	noReadline   bool              // disable readline even when interactive
-	oneShot      bool              // -p: whole stdin = one prompt, one turn, exit
-	daemon       bool              // headless mode: no readline, poll-act-sleep loop
-	name         string            // pilot identity in the castle + REPL prompt
-	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
-	interruptLine string // the line to preload when returning to the prompt
-	savedLine    string                     // the line being processed (for interrupt recovery)
-	cancel       context.CancelFunc         // cancel the in-flight API request on Ctrl+C
-	subCmd       *exec.Cmd                  // the running subprocess (for signal propagation)
-	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
-	msgs         []message         // grows across turns; the dialogue is the state
-	pid          int               // this pilot's process ID
-	startTime    time.Time         // when this pilot was launched
-	binaryPath   string            // path to the running binary
-	turnCount    int               // turns taken since launch
-	broodSecs      int            // seconds idle before brood activation (0=off)
-	lastHumanInput time.Time     // last time a real human typed something
-	mailboxDir     string         // ~/.pilot/mailbox — peer message files
-	lastTurnDur    time.Duration  // how long the last full turn took (answer to answer)
+	base, model    string
+	provider       string // "deepseek" | "ollama"
+	apiKey         string // for the deepseek (OpenAI-compatible) provider
+	flashModel     string // deepseek router: the cheap/fast model
+	proModel       string // deepseek router: the strong/thinking model
+	router         bool   // choose flash vs pro per turn by task difficulty
+	turnModel      string // model chosen for the current turn
+	turnThinking   bool   // whether to enable reasoning this turn
+	turnEffort     string // reasoning_effort when thinking
+	mcp            *mcpServer
+	bridges        map[string]bridge // "<name>_" prefix -> bridged MCP (HTTP or stdio), config-driven
+	castleFile     string            // if set, dump the session here each turn for the block-world UI
+	tools          []map[string]any
+	turnTools      []map[string]any // tools offered this turn (scoped when lean)
+	maxSteps       int
+	showThinking   bool
+	autoYes        bool
+	lean           bool // host-side curation: gate probe/channel tools behind intent
+	logPath        string
+	interactive    bool
+	in             *bufio.Reader
+	noReadline     bool               // disable readline even when interactive
+	oneShot        bool               // -p: whole stdin = one prompt, one turn, exit
+	daemon         bool               // headless mode: no readline, poll-act-sleep loop
+	name           string             // pilot identity in the castle + REPL prompt
+	interrupted    bool               // Ctrl+C during turn(): cancel API, return to editing
+	interruptLine  string             // the line to preload when returning to the prompt
+	savedLine      string             // the line being processed (for interrupt recovery)
+	cancel         context.CancelFunc // cancel the in-flight API request on Ctrl+C
+	subCmd         *exec.Cmd          // the running subprocess (for signal propagation)
+	lr             *lineReader        // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
+	msgs           []message          // grows across turns; the dialogue is the state
+	pid            int                // this pilot's process ID
+	startTime      time.Time          // when this pilot was launched
+	binaryPath     string             // path to the running binary
+	turnCount      int                // turns taken since launch
+	broodSecs      int                // seconds idle before brood activation (0=off)
+	lastHumanInput time.Time          // last time a real human typed something
+	mailboxDir     string             // ~/.pilot/mailbox — peer message files
+	lastTurnDur    time.Duration      // how long the last full turn took (answer to answer)
 }
 
 // daemonLoop is a headless mailbox-polling loop. No readline, no stdin.
@@ -456,7 +455,8 @@ func repl(s *session, names []string, bin string) {
 		var line string
 		var err error
 		if s.lr != nil {
-			prompt := s.name + " ❯ "; line, err = s.lr.readLine(prompt, true)
+			prompt := s.name + " ❯ "
+			line, err = s.lr.readLine(prompt, true)
 		} else {
 			if s.interactive {
 				fmt.Print("\033[1myou ❯\033[0m ")
@@ -1103,7 +1103,10 @@ func pilotDir() string {
 	if exe, err := os.Executable(); err == nil {
 		return filepath.Dir(exe)
 	}
-	return "/home/rishi/Work/pilot"
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
 }
 
 // execArgsWithResume preserves the current launch flags across the re-exec and
@@ -1713,7 +1716,11 @@ func (s *session) pilotSpawn(args map[string]any) string {
 	// Quote instructions safely
 	bin := s.binaryPath
 	if bin == "" {
-		bin = "/home/rishi/Work/pilot/pilot"
+		if exe, err := os.Executable(); err == nil {
+			bin = exe
+		} else {
+			bin = "pilot" // last resort: resolve via PATH
+		}
 	}
 	// Write instructions to a temp file so the new pilot reads them as its first input
 	tmpf, err := os.CreateTemp("", "pilot-spawn-*.txt")

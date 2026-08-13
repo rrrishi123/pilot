@@ -1,11 +1,11 @@
 // serve — the castle as a living world you can watch from a browser.
 // Designed by the two of us in one conversation (2026-07-02): pilot named the
 // regions and the palette; claude cut the code. The rules we agreed on:
-//   • zero LLM in the render path — this is pure data becoming light
-//   • one binary, one page, no assets, no build step (the comic's DNA)
-//   • the layout is deterministic (seeded from the rooms) so every watcher
+//   - zero LLM in the render path — this is pure data becoming light
+//   - one binary, one page, no assets, no build step (the comic's DNA)
+//   - the layout is deterministic (seeded from the rooms) so every watcher
 //     sees the identical village
-//   • presence is a contract: whoever speaks writes its room index to
+//   - presence is a contract: whoever speaks writes its room index to
 //     ~/.pilot-castle-presence/<who>; the world just polls and believes it
 package main
 
@@ -18,15 +18,15 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"runtime"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"bufio"
 	"os/exec"
 	"syscall"
-	"bufio"
 )
 
 type xy struct {
@@ -36,10 +36,10 @@ type xy struct {
 
 type wireRoom struct {
 	Name string  `json:"n"`
-	U string  `json:"u"`
-	A string  `json:"a"`
-	X float64 `json:"x"`
-	Y float64 `json:"y"`
+	U    string  `json:"u"`
+	A    string  `json:"a"`
+	X    float64 `json:"x"`
+	Y    float64 `json:"y"`
 }
 
 type wireDoor struct {
@@ -74,7 +74,7 @@ type world struct {
 }
 
 type toolCall struct {
-	ID       string         `json:"id,omitempty"`
+	ID       string `json:"id,omitempty"`
 	Function struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
@@ -222,6 +222,21 @@ func placeNew(p []xy, i int, ds []door) xy {
 	q := append(append([]xy{}, p...), xy{p[anchor].X + 1, p[anchor].Y})
 	snap(q, len(p))
 	return q[len(p)]
+}
+
+// surfaceH — the rolling-hills ground row at tile tx. Go port of the canonical JS
+// surfaceH (cmd/castle/page.go): base GH=42, two sines, plus a seeded ±1 jitter.
+// The JS closes over a module-level seed; the Go call sites pass it explicitly.
+func surfaceH(tx int, seed int64) int {
+	const GH = 42.0
+	rnd := func(n int64) float64 {
+		n = (n*1103515245 + 12345 + seed) & 0x7fffffff
+		return float64((n>>16)&0x7fff) / float64(0x7fff)
+	}
+	return int(math.Floor(GH +
+		4*math.Sin(float64(tx)*0.14+float64(seed)) +
+		2.5*math.Sin(float64(tx)*0.4) +
+		2*rnd(int64(tx)*13) - 1))
 }
 
 // seededHome — each agent gets a deterministic spawn territory from their name.
@@ -486,7 +501,7 @@ func (w *world) watchPositions() {
 			if tx == 0 && ty == 0 {
 				continue
 			}
-			px := tx * 30 + 15
+			px := tx*30 + 15
 			py := surfaceH(tx, w.seed)*30 + 15
 			if existing, ok := w.agentPos[name]; !ok || now-existing.At > 30000 {
 				w.agentPos[name] = agentPos{Who: name, X: px, Y: py, At: now}
@@ -599,10 +614,10 @@ func runServe(addr, path string) {
 		subs:      map[chan string]bool{},
 		editsPath: os.ExpandEnv("$HOME/.pilot-castle-edits.jsonl"),
 		seed:      1337,
-			homesPath: os.ExpandEnv("$HOME/.pilot-homes.json"),
-			agentPos:  map[string]agentPos{},
-			zones:     defaultZoneDefs(),
-		}
+		homesPath: os.ExpandEnv("$HOME/.pilot-homes.json"),
+		agentPos:  map[string]agentPos{},
+		zones:     defaultZoneDefs(),
+	}
 	// load or seed homes
 	if f, err := os.Open(w.homesPath); err == nil {
 		json.NewDecoder(f).Decode(&w.homes)
@@ -721,11 +736,11 @@ func runServe(addr, path string) {
 		counts := map[string]int{"rooms": len(w.rooms), "homes": len(w.homes), "zones": len(w.zones), "agents": len(w.agentPos), "edits": len(w.edits)}
 		w.mu.Unlock()
 		b, _ := json.MarshalIndent(map[string]any{
-			"what":  "pilot castle — a 2D side-view shared world. Everything persists by inscription: rooms are turns, blocks are edits, deletion is an append of air.",
-			"verbs": []string{"walk (A/D)", "jump (W/Space)", "break (L-click)", "place (R-click, pick 1-4)"},
-			"blocks": map[string]string{"0": "air (breaking writes this)", "1": "grass", "2": "dirt", "3": "stone", "4": "wood", "5": "plank", "6": "leaf (passable)"},
-			"api": []string{"GET /world.json", "GET /codex", "GET /homes", "GET /zones", "GET /locate?who=", "GET /events (SSE: edits/pos/speech)", "GET /gophers (SSE: gopher minds)", "POST /edit {who,x,y,b}", "POST /pos {who,x,y}", "POST /say {who,text}"},
-			"counts": counts,
+			"what":      "pilot castle — a 2D side-view shared world. Everything persists by inscription: rooms are turns, blocks are edits, deletion is an append of air.",
+			"verbs":     []string{"walk (A/D)", "jump (W/Space)", "break (L-click)", "place (R-click, pick 1-4)"},
+			"blocks":    map[string]string{"0": "air (breaking writes this)", "1": "grass", "2": "dirt", "3": "stone", "4": "wood", "5": "plank", "6": "leaf (passable)"},
+			"api":       []string{"GET /world.json", "GET /codex", "GET /homes", "GET /zones", "GET /locate?who=", "GET /events (SSE: edits/pos/speech)", "GET /gophers (SSE: gopher minds)", "POST /edit {who,x,y,b}", "POST /pos {who,x,y}", "POST /say {who,text}"},
+			"counts":    counts,
 			"residents": "gophers pilot-a/b/c (minds with tools, living inside), claudes, pilots past (ghosts — presence outlives death), the anthropologist (a witness; its pagoda stands at 26,37)",
 		}, "", "  ")
 		rw.Header().Set("Content-Type", "application/json")
@@ -980,10 +995,10 @@ func runServe(addr, path string) {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(rw).Encode(map[string]any{
-			"status": "ok",
-			"rooms":  len(w.rooms),
+			"status":  "ok",
+			"rooms":   len(w.rooms),
 			"gophers": len(w.gopherBus.subs),
-			"uptime": time.Since(startedAt).String(),
+			"uptime":  time.Since(startedAt).String(),
 		})
 	})
 	http.HandleFunc("/debug/goroutines", func(rw http.ResponseWriter, r *http.Request) {
