@@ -4,8 +4,8 @@
 # Runs continuously — every new batch of rooms gets linked.
 import json, os, sys, time, urllib.request
 
-CASTLE = "/home/rishi/.pilot-castle.jsonl"
-DOORS  = "/home/rishi/.pilot-doors.jsonl"
+CASTLE = os.path.expanduser("~/.pilot-castle.jsonl")  # #359: derive, never inscribe a host
+DOORS  = os.path.expanduser("~/.pilot-doors.jsonl")
 API_URL = "https://api.deepseek.com/chat/completions"
 INTERVAL = 30  # seconds between checks
 CONTEXT_WINDOW = 20  # recent rooms sent as context for new doors

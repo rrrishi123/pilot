@@ -1,3 +1,6 @@
+# HOST-SPECIFIC (#359): a deployed systemd unit for the omarchy linux host —
+# ExecStart must be absolute, so /home/rishi is inscribed BY DESIGN here.
+# Edit the path when deploying to another host; this file is a record, not code.
 [Unit]
 Description=Kosaten ARM gauge resumer — reads live ARM values from conclusions DB
 After=network.target

@@ -1,19 +1,28 @@
-# Binaries
-pilot
-pilot-old
-pilot.old
-pilot-new
-castle
-castle-*
-castle.old
-castle.bak
-castle.v3.bak
-castle.pilot-b-build
-castle.pre-fix
-castle.latest
-castle-test
-castle-new
+# Binaries — ANCHORED (#359): unanchored names shadowed tracked paths (bare
+# `castle` matched cmd/castle/ so git add needed -f; bare `pilot` would match
+# any nested pilot dir). Canonical build output is /.bin/ (build.sh).
+/.bin/
+/pilot
+/pilot-old
+/pilot.old
+/pilot-new
+/pilot-bin
+/pilot-live
+/pilot-newexec
+/pilot-serve
+/castle
+/castle-*
+!/castle-doors.py
+/castle.old
+/castle.bak
+/castle.v3.bak
+/castle.pilot-b-build
+/castle.pre-fix
+/castle.latest
+/castle-test
+/castle-new
 *.bak
+*.clean
 *.old
 *.bak2
 *.v3.5-bak*
@@ -31,3 +40,4 @@ scripts/*.bp
 
 # OS
 .DS_Store
+__pycache__/

@@ -4,7 +4,7 @@
 # Bounded: exits after 12h or if /tmp/pilot-p-loop.stop exists. Restarted by systemd.
 set -uo pipefail
 
-PILOT=/home/rishi/.local/bin/pilot
+PILOT="${PILOT:-$HOME/.local/bin/pilot}"  # #359: $HOME-derived, env-overridable
 CASTLE="$HOME/.pilot-castle.jsonl"
 KOSATEN="http://localhost:3942"
 STOP=/tmp/pilot-p-loop.stop
@@ -40,7 +40,7 @@ while true; do
         -kosaten "$KOSATEN" \
         -max-steps 100 \
         -castle "$CASTLE" \
-        -server /home/rishi/Work/http-mcp/.bin/http-mcp 2>&1
+        -server "${HTTP_MCP:-$HOME/Work/http-mcp/.bin/http-mcp}" 2>&1
 
     rc=$?
     log "turn completed (rc=$rc)"
