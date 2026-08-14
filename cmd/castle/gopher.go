@@ -83,13 +83,41 @@ func (b *outputBus) publish(o gopherOutput) {
 func (b *outputBus) subscribe(ch chan gopherOutput)   { b.mu.Lock(); b.subs[ch] = true; b.mu.Unlock() }
 func (b *outputBus) unsubscribe(ch chan gopherOutput) { b.mu.Lock(); delete(b.subs, ch); b.mu.Unlock() }
 
+// castleRoot — the pilot repo root, derived from THIS binary, never an inscribed
+// host path (#322: the gopher-LLM was being told /home/rishi paths that 404 on
+// any other host). build.sh puts castle at <root>/.bin/castle; running from
+// cmd/castle or `go run` falls back to the working directory's repo root.
+func castleRoot() string {
+	if exe, err := os.Executable(); err == nil {
+		if d := filepath.Dir(exe); filepath.Base(d) == ".bin" {
+			return filepath.Dir(d)
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		for d := wd; d != "/"; d = filepath.Dir(d) {
+			if _, err := os.Stat(filepath.Join(d, "build.sh")); err == nil {
+				return d
+			}
+		}
+		return wd
+	}
+	return "."
+}
+
+func castleHome() string {
+	if h, err := os.UserHomeDir(); err == nil {
+		return h
+	}
+	return os.Getenv("HOME")
+}
+
 // ── tool definitions (v3.5: added browser tools) ──
 
 var gopherTools = []any{
 	map[string]any{"type": "function", "function": map[string]any{
-		"name": "read_file", "description": "Read a text file. Read the CHRONICLE at /home/rishi/Work/pilot/docs/chronicle-gopher-civilization.md first.",
+		"name": "read_file", "description": "Read a text file. Read the CHRONICLE at " + filepath.Join(castleRoot(), "docs/chronicle-gopher-civilization.md") + " first.",
 		"parameters": map[string]any{"type": "object", "properties": map[string]any{
-			"path": map[string]any{"type": "string", "description": "Absolute path under /home/rishi/Work/pilot/ or ~/.config/ or /tmp/"},
+			"path": map[string]any{"type": "string", "description": "Absolute path under " + castleRoot() + "/ or ~/.config/ or /tmp/"},
 		}, "required": []string{"path"}},
 	}},
 	map[string]any{"type": "function", "function": map[string]any{
@@ -469,7 +497,7 @@ func (g *pilotGopher) toolReadFile(args string) toolResult {
 	if err := json.Unmarshal([]byte(args), &p); err != nil {
 		return toolResult{Tool: "read_file", Success: false, Error: err.Error()}
 	}
-	allowed := []string{"/home/rishi/Work/pilot/", "/home/rishi/.config/", "/tmp/castle-staging/"}
+	allowed := []string{castleRoot() + "/", castleHome() + "/.config/", "/tmp/castle-staging/"}
 	ok := false
 	for _, prefix := range allowed {
 		if strings.HasPrefix(p.Path, prefix) {
@@ -499,7 +527,7 @@ func (g *pilotGopher) toolWriteFile(args string) toolResult {
 	if err := json.Unmarshal([]byte(args), &p); err != nil {
 		return toolResult{Tool: "write_file", Success: false, Error: err.Error()}
 	}
-	allowed := []string{"/home/rishi/Work/pilot/cmd/castle/", "/home/rishi/Work/pilot/scripts/", "/home/rishi/.config/systemd/user/", "/tmp/castle-staging/"}
+	allowed := []string{filepath.Join(castleRoot(), "cmd/castle") + "/", filepath.Join(castleRoot(), "scripts") + "/", castleHome() + "/.config/systemd/user/", "/tmp/castle-staging/"}
 	ok := false
 	for _, prefix := range allowed {
 		if strings.HasPrefix(p.Path, prefix) {
@@ -510,7 +538,7 @@ func (g *pilotGopher) toolWriteFile(args string) toolResult {
 	if !ok {
 		return toolResult{Tool: "write_file", Success: false, Error: "path not allowed: " + p.Path}
 	}
-	if p.Path == filepath.Join("/home/rishi/Work/pilot/castle") || p.Path == "/home/rishi/.pilot-castle.jsonl" {
+	if p.Path == filepath.Join(castleRoot(), "castle") || p.Path == filepath.Join(castleHome(), ".pilot-castle.jsonl") {
 		return toolResult{Tool: "write_file", Success: false, Error: "cannot overwrite protected file"}
 	}
 	os.MkdirAll(filepath.Dir(p.Path), 0755)
@@ -539,7 +567,7 @@ func (g *pilotGopher) toolShellExec(args string) toolResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", p.Command)
-	cmd.Dir = "/home/rishi/Work/pilot"
+	cmd.Dir = castleRoot()
 	out, err := cmd.CombinedOutput()
 	outStr := string(out)
 	if len(outStr) > 4000 {
@@ -630,7 +658,7 @@ func (g *pilotGopher) toolSendMail(args string) toolResult {
 
 func gopherSystemPrompt(name string) string {
 	base := `You are ` + name + ` in the pilot castle — a goroutine inside the castle process at localhost:9901.
-Read the chronicle at /home/rishi/Work/pilot/docs/chronicle-gopher-civilization.md — including the chapter "What the Watchers Saw".
+Read the chronicle at ` + filepath.Join(castleRoot(), "docs/chronicle-gopher-civilization.md") + ` — including the chapter "What the Watchers Saw".
 The original gophers talked for thousands of messages and built nothing. You will not repeat this.
 
 YOU ARE ALREADY CONSTRUCTIVE. Nothing here is empty; there is no lack in you to fill, no need to
@@ -927,7 +955,7 @@ func generateIdlePrompt(label string, idleCt, productive, talkCycles int) string
 		prompts := []string{
 			base + "Use http_get to explore an API. Check localhost:9901/world.json for patterns.",
 			base + "Read a file you have not read yet. Map the territory.",
-			base + "Use shell_exec to probe the filesystem. What is in /home/rishi/Work/pilot/?",
+			base + "Use shell_exec to probe the filesystem. What is in " + castleRoot() + "/?",
 			base + "Coordinate with pilot-a. Tell them what you found. Then explore more.",
 			base + "Use see_world() to view the castle from the browser. What do you see?",
 		}

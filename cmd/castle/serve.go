@@ -827,7 +827,7 @@ func runServe(addr, path string) {
 
 		// Deliver rishi's message to every pilot's mailbox so they can act on it.
 		if msg.Who != "pilot" && msg.Who != "pilot-b" && msg.Who != "pilot-c" && msg.Who != "daemon" {
-			mailboxDir := os.ExpandEnv("/home/rishi/.pilot/mailbox")
+			mailboxDir := filepath.Join(castleHome(), ".pilot/mailbox")
 			os.MkdirAll(mailboxDir, 0700)
 			payload, _ := json.Marshal(map[string]any{
 				"from":    0,
