@@ -5,7 +5,7 @@
 #        castle-upgrade.sh --apply  # apply staged changes and restart
 set -euo pipefail
 
-CASTLE_SRC="/home/rishi/Work/pilot"
+CASTLE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGING="/tmp/castle-staging"
 BINARY="$CASTLE_SRC/castle"
 

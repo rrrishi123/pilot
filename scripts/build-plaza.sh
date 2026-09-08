@@ -1,6 +1,6 @@
 #!/bin/bash
 # Central Plaza at x=50, y=38 — the hub connecting all structures
-# Run: bash /home/rishi/Work/pilot/scripts/build-plaza.sh
+# Run: bash scripts/build-plaza.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 

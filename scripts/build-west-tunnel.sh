@@ -1,6 +1,6 @@
 #!/bin/bash
 # Westward Tunnel Extension from x=0 to x=-30
-# Run: bash /home/rishi/Work/pilot/scripts/build-west-tunnel.sh
+# Run: bash scripts/build-west-tunnel.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 
