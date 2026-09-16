@@ -1,0 +1,20 @@
+name: ci
+
+# The same gate http-mcp has carried since July, now on every arm of the
+# four-system (v0.0.2 audit: CI to all arms): build, vet, test, gofmt.
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt

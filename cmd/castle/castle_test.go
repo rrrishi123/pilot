@@ -22,6 +22,14 @@ func TestSpawn_Smoke(t *testing.T) {
 		t.Fatalf("go build failed: %s\n%s", buildErr, string(buildOut))
 	}
 	defer os.Remove("castle-test")
+	// /spawn resolves the pilot daemon beside the castle binary, then PATH
+	// (serve.go). A test or CI runner has neither, so build the root package
+	// next to castle-test — the same layout build.sh produces.
+	pilotOut, pilotErr := exec.Command("go", "build", "-o", "pilot", "../..").CombinedOutput()
+	if pilotErr != nil {
+		t.Fatalf("go build pilot failed: %s\n%s", pilotErr, string(pilotOut))
+	}
+	defer os.Remove("pilot")
 
 	tmpCastle, err := os.CreateTemp("", "castle-test-*.jsonl")
 	if err != nil {
@@ -82,7 +90,7 @@ func TestSpawn_Smoke(t *testing.T) {
 
 	// Verify process running
 	time.Sleep(500 * time.Millisecond)
-	psOut, _ := exec.Command("ps", "-p", fmt.Sprintf("%d", r.PID)).CombinedOutput()
+	psOut, _ := exec.Command("ps", "-p", fmt.Sprintf("%d", r.PID), "-o", "args=").CombinedOutput() // args=: Linux ps -p prints only the comm
 	if !strings.Contains(string(psOut), "test-spawn") {
 		t.Fatalf("process %d not running: %s", r.PID, string(psOut))
 	}

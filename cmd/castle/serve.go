@@ -919,7 +919,7 @@ func runServe(addr, path string) {
 		if err := cmd.Start(); err != nil {
 			rw.Header().Set("Content-Type", "application/json")
 			rw.WriteHeader(500)
-			fmt.Fprintf(rw, `{"error":"spawn failed: %v"}`, err)
+			fmt.Fprintf(rw, `{"error":%q}`, "spawn failed: "+err.Error()) // %q: the error text carries quotes (exec: "pilot": ...)
 			return
 		}
 		pid := cmd.Process.Pid
