@@ -13,8 +13,7 @@ CONTEXT_WINDOW = 20  # recent rooms sent as context for new doors
 def api_key():
     k = os.environ.get("DEEPSEEK_API_KEY", "")
     if k: return k
-    for p in [f"{os.environ['HOME']}/Work/kosaten/.env",
-              f"{os.environ['HOME']}/.pilot.env"]:
+    for p in [os.path.expanduser("~/.pilot.env")]:  # #1110: dropped private kosaten/.env fallback (public cut)
         if os.path.exists(p):
             with open(p) as f:
                 for line in f:

@@ -41,3 +41,9 @@ scripts/*.bp
 # OS
 .DS_Store
 __pycache__/
+
+# #1110 public cut: private kosaten operational tooling (kept local, out of the public tree)
+/watcher.sh
+/scripts/arm-resumer.sh
+/scripts/arm-resumer.service
+/scripts/arm-resumer.timer

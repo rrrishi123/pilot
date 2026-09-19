@@ -63,7 +63,7 @@ const deepseekCapabilities = "You run on the DeepSeek API (OpenAI-compatible). K
 	"You call tools with JSON args and read the real result back; JSON output mode and automatic prompt-prefix caching (cheaper cache hits) are available. " +
 	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — the broker enforces per-agent tab leases. Protocol: (1) POST {\"claim\":\"agent-id\"} to claim your private browsingContext — returns context. (2) Tag every BiDi command with {\"agent\":\"agent-id\",method,params} — the broker injects your leased context, no collision. (3) {\"heartbeat\":\"id\"} keeps your lease alive. (4) {\"release\":\"id\"} closes only your tab — NEVER session.end/DeleteSession (refused at broker, kills shared session). (5) GET /leases to see all agents. (6) GET /health carries invariants: Firefox under XWayland (MOZ_ENABLE_WAYLAND=0) — never relaunch native-Wayland (crashes Hyprland); ONE shared socket at :4445 — never open a 2nd websocket or call session.new (refused); and use this machine's shell and filesystem. " +
 	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read. " +
-	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR (default ~/Desktop/repos/pilot) — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
+	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
 
 // loadEnvFile pulls KEY=VALUE lines from $PILOT_ENV (or ~/.pilot.env) into the process
 // env — so plain `./pilot` works without hand-sourcing DEEPSEEK_API_KEY/KOSATEN_API_KEY.
@@ -121,12 +121,12 @@ func main() {
 	daemon := flag.Bool("daemon", false, "no-readline daemon mode: poll mailbox + act + sleep (implies -brood 60)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
-	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
-	// no need to pass -kosaten by hand (office has no local kosaten; omarchy does).
+	// kosaten default: if aimed at local and it isn't up, fall back to a hosted MCP URL
+	// from $KOSATEN_MCP_URL (empty = disable the bridge). No private endpoint is shipped.
 	if *kosatenURL == "http://localhost:3942" {
 		cl := &http.Client{Timeout: 1500 * time.Millisecond}
 		if r, e := cl.Get("http://localhost:3942/health"); e != nil || r.StatusCode != 200 {
-			*kosatenURL = "https://mcp.kosaten.ai/mcp"
+			*kosatenURL = os.Getenv("KOSATEN_MCP_URL")
 		} else {
 			r.Body.Close()
 		}
