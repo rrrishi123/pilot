@@ -36,6 +36,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -948,7 +949,7 @@ func (m *mcpServer) handshake() ([]map[string]any, error) {
 	if _, err := m.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo":      map[string]any{"name": "pilot", "version": selfVersion()},
 	}); err != nil {
 		return nil, err
 	}
@@ -1274,7 +1275,7 @@ type mcpTool struct {
 func (h *httpMCP) listTools() ([]mcpTool, error) {
 	_, sid, err := h.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
-		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo": map[string]any{"name": "pilot", "version": selfVersion()},
 	})
 	if err != nil {
 		return nil, err
@@ -1328,7 +1329,7 @@ func startStdio(sp mcpSpec, logPath string) (*mcpServer, error) {
 func (m *mcpServer) listTools() ([]mcpTool, error) {
 	if _, err := m.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
-		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo": map[string]any{"name": "pilot", "version": selfVersion()},
 	}); err != nil {
 		return nil, err
 	}
@@ -1825,4 +1826,21 @@ func oneLine(s string) string {
 		s = s[:200] + "…"
 	}
 	return s
+}
+
+// fallbackVersion is reported when the binary carries no module version
+// (a `go build` of a working tree reports "(devel)"); `go install ...@vX.Y.Z`
+// stamps the real tag into the build info and that wins.
+const fallbackVersion = "v0.0.3"
+
+// selfVersion is the version pilot reports in MCP clientInfo — derived from
+// the module build info so the tag, not a hand-edited literal, is the source
+// of truth.
+func selfVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return fallbackVersion
 }
