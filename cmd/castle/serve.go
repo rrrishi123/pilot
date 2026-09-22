@@ -474,7 +474,7 @@ func (w *world) watchWire() {
 	}
 }
 
-// watchHealth — :3942/health is kosaten's one free read; the towers and the
+// watchHealth reads the bridged brain's health endpoint; the towers and the
 // courtyard breathe from it.
 func (w *world) watchPositions() {
 	for range time.Tick(8 * time.Second) {
@@ -516,8 +516,12 @@ func (w *world) watchPositions() {
 }
 
 func (w *world) watchHealth() {
+	url := os.Getenv("CASTLE_BRAIN_HEALTH") // e.g. http://localhost:3942/health; empty = no brain to watch
+	if url == "" {
+		return
+	}
 	for range time.Tick(15 * time.Second) {
-		resp, err := http.Get("http://localhost:3942/health")
+		resp, err := http.Get(url)
 		if err != nil {
 			continue
 		}
@@ -799,7 +803,7 @@ func runServe(addr, path string) {
 	// a line spoken here is appended to ~/.pilot-commons.jsonl (a file,
 	// believed), rises as a bubble, and is forwarded into pilot's REPL so the
 	// answer comes back through the castle the way pilot always answers.
-	// kosaten speaks through pilot (its bridge); claude reads the commons when
+	// the bridged brain speaks through pilot; claude reads the commons when
 	// it wakes — its strand is honest about its deaths.
 	commonsPath := os.ExpandEnv("$HOME/.pilot-commons.jsonl")
 	http.HandleFunc("/say", func(rw http.ResponseWriter, r *http.Request) {
@@ -911,7 +915,6 @@ func runServe(addr, path string) {
 			"-name", req.Name,
 			"-castle", w.path,
 			"-brood", fmt.Sprint(req.BroodSecs),
-			"-kosaten", "http://localhost:3942",
 		)
 		cmd.Dir = filepath.Dir(pilotBin)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

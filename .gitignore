@@ -47,3 +47,6 @@ __pycache__/
 /scripts/arm-resumer.sh
 /scripts/arm-resumer.service
 /scripts/arm-resumer.timer
+
+# operator-local private loop — archived from git (#1096 MF#2)
+pilot-p-loop.sh

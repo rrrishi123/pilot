@@ -84,7 +84,7 @@ func spawn(t *testing.T, addr, name string) spawnReply {
 // uses, for a bounded window. pilot/main.go exits 1 naming the missing
 // prerequisite — a brain key (DEEPSEEK_API_KEY or ~/.pilot.env) or the
 // http-mcp tool-server (HTTP_MCP_BIN / PATH / ../http-mcp) — within ~2s
-// (its kosaten health probe alone is a 1.5s timeout); a bare CI runner has
+// (its startup substrate checks alone can take ~2s); a bare CI runner has
 // neither. Returns the daemon's own reason when it cannot start here.
 func daemonCanStart(t *testing.T) (bool, string) {
 	t.Helper()
@@ -96,7 +96,7 @@ func daemonCanStart(t *testing.T) (bool, string) {
 	defer os.Remove(world.Name())
 	var stderr bytes.Buffer
 	cmd := exec.Command("./pilot", "--daemon", "-name", "preflight", "-castle", world.Name(),
-		"-brood", "1", "-kosaten", "http://localhost:3942")
+		"-brood", "1")
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return false, err.Error()

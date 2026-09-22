@@ -15,7 +15,7 @@ Release-readiness follow-ups to the v0.0.2 line:
 
 ## v0.0.2 — 2026-09
 
-- **public cut**: private kosaten references dropped from the tree.
+- **public cut**: private references dropped from the tree.
 - **castle**: the living-world view — `/spawn` contract with tests, liveness
   only where a daemon can live; derives its paths from its own binary, not an
   inscribed host.

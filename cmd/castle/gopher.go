@@ -84,7 +84,7 @@ func (b *outputBus) subscribe(ch chan gopherOutput)   { b.mu.Lock(); b.subs[ch] 
 func (b *outputBus) unsubscribe(ch chan gopherOutput) { b.mu.Lock(); delete(b.subs, ch); b.mu.Unlock() }
 
 // castleRoot — the pilot repo root, derived from THIS binary, never an inscribed
-// host path (#322: the gopher-LLM was being told /home/rishi paths that 404 on
+// host path (#322: the gopher-LLM was being told absolute host paths that 404 on
 // any other host). build.sh puts castle at <root>/.bin/castle; running from
 // cmd/castle or `go run` falls back to the working directory's repo root.
 func castleRoot() string {

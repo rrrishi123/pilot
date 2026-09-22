@@ -13,7 +13,7 @@ CONTEXT_WINDOW = 20  # recent rooms sent as context for new doors
 def api_key():
     k = os.environ.get("DEEPSEEK_API_KEY", "")
     if k: return k
-    for p in [os.path.expanduser("~/.pilot.env")]:  # #1110: dropped private kosaten/.env fallback (public cut)
+    for p in [os.path.expanduser("~/.pilot.env")]:  # #1110: dropped a private .env fallback (public cut)
         if os.path.exists(p):
             with open(p) as f:
                 for line in f:
@@ -68,7 +68,7 @@ def find_doors(key, rooms, start_idx):
 {room_list}
 Rooms that touch the same concern — even across time, even in different words — are connected. Find doors between NEW rooms [{start_idx}..{len(recent)+start_idx-1}] and any room.
 
-Topics include: identity, pilots, self-modification, REPL, tools, code, the wire, castle, block-world, minimap, doors, presence, peers, kosaten, organism, heartbeats, streaming output.
+Topics include: identity, pilots, self-modification, REPL, tools, code, the wire, castle, block-world, minimap, doors, presence, peers, organism, heartbeats, streaming output.
 
 Output ONLY a JSON array of {{"from":N,"to":N,"weight":0.X,"thread":"label"}}.
 Doors must connect rooms that share a real concern. No frivolous connections."""
