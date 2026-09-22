@@ -35,14 +35,14 @@ cmd/castle/page.go.pre*
 cmd/castle/surfaceH.go
 
 # Data
-kosaten.db
+*.db
 scripts/*.bp
 
 # OS
 .DS_Store
 __pycache__/
 
-# #1110 public cut: private kosaten operational tooling (kept local, out of the public tree)
+# #1110 public cut: private operational tooling (kept local, out of the public tree)
 /watcher.sh
 /scripts/arm-resumer.sh
 /scripts/arm-resumer.service
