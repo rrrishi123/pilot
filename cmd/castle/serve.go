@@ -516,7 +516,7 @@ func (w *world) watchPositions() {
 }
 
 func (w *world) watchHealth() {
-	url := os.Getenv("CASTLE_BRAIN_HEALTH") // e.g. http://localhost:3942/health; empty = no brain to watch
+	url := os.Getenv("CASTLE_BRAIN_HEALTH") // e.g. http://127.0.0.1:8080/health; empty = no brain to watch
 	if url == "" {
 		return
 	}
