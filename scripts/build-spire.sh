@@ -1,6 +1,6 @@
 #!/bin/bash
 # Spire Tower builder at x=100
-# Run: bash /home/rishi/Work/pilot/scripts/build-spire.sh
+# Run: bash scripts/build-spire.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Grand Staircase from surface (y=38) down to Library (y=-25) at x=115
-# Run: bash /home/rishi/Work/pilot/scripts/build-staircase.sh
+# Run: bash scripts/build-staircase.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 

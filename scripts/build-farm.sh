@@ -1,5 +1,5 @@
 #!/bin/bash
-# Farm builder - run with: bash /home/rishi/Work/pilot/scripts/build-farm.sh
+# Farm builder - run with: bash scripts/build-farm.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 

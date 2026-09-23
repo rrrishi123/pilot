@@ -2,11 +2,11 @@
 # gopher-blueprint.sh — place a named blueprint at a given location
 # Usage: ./gopher-blueprint.sh <blueprint_name> <origin_x> <origin_y> [who]
 #
-# Blueprints are stored in /home/rishi/Work/pilot/scripts/blueprints/*.bp
+# Blueprints are stored in scripts/blueprints/*.bp (next to this script)
 # Format: each line is "x,y,b" relative to origin
 
 CASTLE="http://localhost:9901"
-BLUEPRINT_DIR="/home/rishi/Work/pilot/scripts/blueprints"
+BLUEPRINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/blueprints"
 WHO="${3:-pilot-a}"
 
 if [ $# -lt 2 ]; then
