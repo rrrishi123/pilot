@@ -1806,8 +1806,13 @@ func oneLine(s string) string {
 
 // fallbackVersion is reported when the binary carries no module version
 // (a `go build` of a working tree reports "(devel)"); `go install ...@vX.Y.Z`
-// stamps the real tag into the build info and that wins.
-const fallbackVersion = "v0.0.3"
+// stamps the real tag into the build info and that wins. It tracks the wire
+// contract's version (http-mcp contract.Version), which is currently v0.0.2 —
+// a dev build of pilot must not claim a version ahead of the contract it
+// implements. Bump this in lockstep with contract.Version at the release cut
+// (pilot is a separate module and does not import http-mcp/contract — the
+// single-source coupling is the open D1/contract decision).
+const fallbackVersion = "v0.0.2"
 
 // selfVersion is the version pilot reports in MCP clientInfo — derived from
 // the module build info so the tag, not a hand-edited literal, is the source
