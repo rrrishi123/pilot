@@ -36,11 +36,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
 )
 
 const defaultModel = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q4_K_M"
@@ -57,17 +57,17 @@ const system = "You are a local assistant with hands: tools that make real calls
 
 // deepseekCapabilities tells pilot about its own substrate and this environment,
 // so it acts from knowledge (like an operator who knows the box) instead of
-// guessing — the gap seen when it probed REST paths that kosaten doesn't serve.
+// guessing — the gap seen when it probed REST paths a bridged MCP doesn't serve.
 const deepseekCapabilities = "You run on the DeepSeek API (OpenAI-compatible). Know your substrate: " +
 	"models resolve live from /models — deepseek-v4-flash (fast/cheap ~$0.14/M in, $0.28/M out) and deepseek-v4-pro (stronger ~$0.44/M in, $0.87/M out), both 1M-token context; deepseek-chat/reasoner retire 2026-07-24. " +
 	"You can reason before answering (reasoning effort high/medium/low) — reasoning costs output tokens, so spend it on hard multi-step problems, not trivial replies. " +
 	"You call tools with JSON args and read the real result back; JSON output mode and automatic prompt-prefix caching (cheaper cache hits) are available. " +
 	"You are a Claude-independent operator on this Linux box. You can: drive the http-mcp wire (http_request, discover, bidi_command); drive the logged-in Firefox peer through the BiDi broker at http://localhost:4445/command — the broker enforces per-agent tab leases. Protocol: (1) POST {\"claim\":\"agent-id\"} to claim your private browsingContext — returns context. (2) Tag every BiDi command with {\"agent\":\"agent-id\",method,params} — the broker injects your leased context, no collision. (3) {\"heartbeat\":\"id\"} keeps your lease alive. (4) {\"release\":\"id\"} closes only your tab — NEVER session.end/DeleteSession (refused at broker, kills shared session). (5) GET /leases to see all agents. (6) GET /health carries invariants: Firefox under XWayland (MOZ_ENABLE_WAYLAND=0) — never relaunch native-Wayland (crashes Hyprland); ONE shared socket at :4445 — never open a 2nd websocket or call session.new (refused); and use this machine's shell and filesystem. " +
-	"Reach the kosaten organism at http://localhost:3942 — it speaks MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read. " +
-	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR (default ~/Desktop/repos/pilot) — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
+	"External MCP servers you are configured to bridge (declared in ~/.pilot/mcp.json) speak MCP JSON-RPC (POST /: initialize, then keep the Mcp-Session-Id response header, then tools/call, with an Authorization: Bearer token), NOT REST — do not guess REST paths; GET /health is the one unauthenticated read. Their tools appear prefixed with the server's name. " +
+	"You are SELF-MODIFIABLE: you ARE the Go program 'pilot', whose source lives at $PILOT_DIR — main.go is the host loop, lineedit.go the line editor. You can read_file and write_file your own source and then tell the user to run /redeploy (rebuild + re-exec in place, session preserved) to become the new code. Your confirmation prompt for run_command/write_file lives in main.go (the autoYes gate); the operator can toggle it live with /yes (trust on) or /ask (prompts on), or launch you with -yes. So when asked to change your own behavior, edit your source — do not invent external shims."
 
 // loadEnvFile pulls KEY=VALUE lines from $PILOT_ENV (or ~/.pilot.env) into the process
-// env — so plain `./pilot` works without hand-sourcing DEEPSEEK_API_KEY/KOSATEN_API_KEY.
+// env — so plain `./pilot` works without hand-sourcing DEEPSEEK_API_KEY or any MCP key.
 // Real env wins (only sets unset keys). Tolerates `export ` prefixes and quoted values.
 func loadEnvFile() {
 	var paths []string
@@ -112,7 +112,7 @@ func main() {
 	lean := flag.Bool("lean", false, "host-side curation: offer only the core tools each turn, unlocking probe/channel tools (discover, bidi_command) when the turn's intent asks for them — raises the floor for a weak model")
 	logPath := flag.String("log", filepath.Join(os.TempDir(), "pilot-toolserver.log"),
 		"file for the tool-server's logs, so they stay out of the chat")
-	kosatenURL := flag.String("kosaten", "http://localhost:3942", "kosaten MCP URL to bridge its curated tools (empty to disable)")
+	mcpURL := flag.String("mcp", "", "single external MCP URL to bridge (empty = disabled, the default; prefer ~/.pilot/mcp.json for several)")
 	noReadline := flag.Bool("no-readline", false, "disable readline line-editing (fall back to raw stdin)")
 	oneShot := flag.Bool("p", false, "one-shot print mode: read ALL of stdin as a single prompt, run one turn (tools allowed), print, exit — the claude -p convention. Without -p, piped stdin is one turn PER LINE.")
 	resume := flag.String("resume", "", "resume a saved session file (used internally by /redeploy)")
@@ -122,20 +122,10 @@ func main() {
 	daemon := flag.Bool("daemon", false, "no-readline daemon mode: poll mailbox + act + sleep (implies -brood 60)")
 	flag.Parse()
 	loadEnvFile() // so plain `./pilot` works: pull keys from $PILOT_ENV or ~/.pilot.env
-	// kosaten default: if aimed at local and it isn't up, fall back to the hosted MCP —
-	// no need to pass -kosaten by hand (office has no local kosaten; omarchy does).
-	if *kosatenURL == "http://localhost:3942" {
-		cl := &http.Client{Timeout: 1500 * time.Millisecond}
-		if r, e := cl.Get("http://localhost:3942/health"); e != nil || r.StatusCode != 200 {
-			*kosatenURL = "https://mcp.kosaten.ai/mcp"
-		} else {
-			r.Body.Close()
-		}
-	}
 
 	// Brain selection. Default is DeepSeek — pilot is the Claude-independent door:
 	// a DeepSeek-driven REPL ("a you that isn't you"). Its own provider definition;
-	// kosaten keeps its own, separately (nothing shared across the private/open line).
+	// a bridged brain keeps its own, separately (nothing shared across the private/open line).
 	base := *ollama
 	apiKey := ""
 	mdl := *model
@@ -185,11 +175,11 @@ func main() {
 
 	// GENERIC MCP BRIDGES — declared in config ($PILOT_MCP or ~/.pilot/mcp.json), NOT in
 	// code, so a new local/cloud MCP is added by config. The same binary runs anywhere:
-	// each server that isn't reachable is skipped (office has local ltqa + hosted kosaten;
-	// omarchy has local kosaten; a stranger has their own — no code change for any of it).
-	// -kosaten is kept as a built-in fallback spec when no config file exists.
+	// each server that isn't reachable is skipped (a host may have local ltqa + a hosted brain;
+	// a peer host has its own local brain; a stranger has theirs — no code change for any of it).
+	// -mcp is a single-server fallback when no config file exists.
 	bridges := map[string]bridge{} // "<name>_" prefix -> bridged server (HTTP or stdio)
-	for _, sp := range loadMCPSpecs(*kosatenURL) {
+	for _, sp := range loadMCPSpecs(*mcpURL) {
 		h, mtools, err := startMCP(sp, *logPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[2mpilot: mcp %q off (%v)\033[0m\n", sp.Name, err)
@@ -263,46 +253,46 @@ func main() {
 // ---- conversation ----
 
 type session struct {
-	base, model  string
-	provider     string // "deepseek" | "ollama"
-	apiKey       string // for the deepseek (OpenAI-compatible) provider
-	flashModel   string // deepseek router: the cheap/fast model
-	proModel     string // deepseek router: the strong/thinking model
-	router       bool   // choose flash vs pro per turn by task difficulty
-	turnModel    string // model chosen for the current turn
-	turnThinking bool   // whether to enable reasoning this turn
-	turnEffort   string // reasoning_effort when thinking
-	mcp          *mcpServer
-	bridges      map[string]bridge   // "<name>_" prefix -> bridged MCP (HTTP or stdio), config-driven
-	castleFile   string   // if set, dump the session here each turn for the block-world UI
-	tools        []map[string]any
-	turnTools    []map[string]any // tools offered this turn (scoped when lean)
-	maxSteps     int
-	showThinking bool
-	autoYes      bool
-	lean         bool // host-side curation: gate probe/channel tools behind intent
-	logPath      string
-	interactive  bool
-	in           *bufio.Reader
-	noReadline   bool              // disable readline even when interactive
-	oneShot      bool              // -p: whole stdin = one prompt, one turn, exit
-	daemon       bool              // headless mode: no readline, poll-act-sleep loop
-	name         string            // pilot identity in the castle + REPL prompt
-	interrupted  bool   // Ctrl+C during turn(): cancel API, return to editing
-	interruptLine string // the line to preload when returning to the prompt
-	savedLine    string                     // the line being processed (for interrupt recovery)
-	cancel       context.CancelFunc         // cancel the in-flight API request on Ctrl+C
-	subCmd       *exec.Cmd                  // the running subprocess (for signal propagation)
-	lr           *lineReader       // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
-	msgs         []message         // grows across turns; the dialogue is the state
-	pid          int               // this pilot's process ID
-	startTime    time.Time         // when this pilot was launched
-	binaryPath   string            // path to the running binary
-	turnCount    int               // turns taken since launch
-	broodSecs      int            // seconds idle before brood activation (0=off)
-	lastHumanInput time.Time     // last time a real human typed something
-	mailboxDir     string         // ~/.pilot/mailbox — peer message files
-	lastTurnDur    time.Duration  // how long the last full turn took (answer to answer)
+	base, model    string
+	provider       string // "deepseek" | "ollama"
+	apiKey         string // for the deepseek (OpenAI-compatible) provider
+	flashModel     string // deepseek router: the cheap/fast model
+	proModel       string // deepseek router: the strong/thinking model
+	router         bool   // choose flash vs pro per turn by task difficulty
+	turnModel      string // model chosen for the current turn
+	turnThinking   bool   // whether to enable reasoning this turn
+	turnEffort     string // reasoning_effort when thinking
+	mcp            *mcpServer
+	bridges        map[string]bridge // "<name>_" prefix -> bridged MCP (HTTP or stdio), config-driven
+	castleFile     string            // if set, dump the session here each turn for the block-world UI
+	tools          []map[string]any
+	turnTools      []map[string]any // tools offered this turn (scoped when lean)
+	maxSteps       int
+	showThinking   bool
+	autoYes        bool
+	lean           bool // host-side curation: gate probe/channel tools behind intent
+	logPath        string
+	interactive    bool
+	in             *bufio.Reader
+	noReadline     bool               // disable readline even when interactive
+	oneShot        bool               // -p: whole stdin = one prompt, one turn, exit
+	daemon         bool               // headless mode: no readline, poll-act-sleep loop
+	name           string             // pilot identity in the castle + REPL prompt
+	interrupted    bool               // Ctrl+C during turn(): cancel API, return to editing
+	interruptLine  string             // the line to preload when returning to the prompt
+	savedLine      string             // the line being processed (for interrupt recovery)
+	cancel         context.CancelFunc // cancel the in-flight API request on Ctrl+C
+	subCmd         *exec.Cmd          // the running subprocess (for signal propagation)
+	lr             *lineReader        // raw-mode line editor with bracketed paste (nil when piped or -no-readline)
+	msgs           []message          // grows across turns; the dialogue is the state
+	pid            int                // this pilot's process ID
+	startTime      time.Time          // when this pilot was launched
+	binaryPath     string             // path to the running binary
+	turnCount      int                // turns taken since launch
+	broodSecs      int                // seconds idle before brood activation (0=off)
+	lastHumanInput time.Time          // last time a real human typed something
+	mailboxDir     string             // ~/.pilot/mailbox — peer message files
+	lastTurnDur    time.Duration      // how long the last full turn took (answer to answer)
 }
 
 // daemonLoop is a headless mailbox-polling loop. No readline, no stdin.
@@ -393,7 +383,7 @@ func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
 	// -p (one-shot print mode): the whole of stdin is ONE prompt, one turn, exit.
 	// This is the claude -p convention. Three independent callers (pilot-p-loop.sh,
-	// kosaten's delegate at internal/mcp/delegate.go, the .anthro scripts' idiom)
+	// a delegate idiom (internal/mcp/delegate.go, the .anthro scripts' idiom)
 	// all reached for `pilot -p` before it existed — each filled the interface gap
 	// with the same coherent model (the anthropologist's inversion law, 2026-07-12).
 	// Rather than repair every caller to the quirky line-per-turn pipe contract,
@@ -456,7 +446,8 @@ func repl(s *session, names []string, bin string) {
 		var line string
 		var err error
 		if s.lr != nil {
-			prompt := s.name + " ❯ "; line, err = s.lr.readLine(prompt, true)
+			prompt := s.name + " ❯ "
+			line, err = s.lr.readLine(prompt, true)
 		} else {
 			if s.interactive {
 				fmt.Print("\033[1myou ❯\033[0m ")
@@ -760,7 +751,7 @@ func (s *session) chatDeepSeek(tools []map[string]any) (message, error) {
 
 // resolveDeepSeekModel asks the API which models exist now and prefers the cheap
 // flash tier — pilot's own dynamic resolution so no model name is hardcoded
-// (kosaten keeps its own, separate resolver). Falls back to v4-flash if offline.
+// (a bridged brain keeps its own, separate resolver). Falls back to v4-flash if offline.
 func resolveDeepSeekModel(apiKey, role string) string {
 	fallback, prefer := "deepseek-v4-flash", []string{"flash", "chat"}
 	if role == "pro" {
@@ -948,7 +939,7 @@ func (m *mcpServer) handshake() ([]map[string]any, error) {
 	if _, err := m.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo":      map[string]any{"name": "pilot", "version": selfVersion()},
 	}); err != nil {
 		return nil, err
 	}
@@ -1103,7 +1094,10 @@ func pilotDir() string {
 	if exe, err := os.Executable(); err == nil {
 		return filepath.Dir(exe)
 	}
-	return "/home/rishi/Work/pilot"
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
 }
 
 // execArgsWithResume preserves the current launch flags across the re-exec and
@@ -1128,23 +1122,13 @@ func execArgsWithResume(sessFile string) []string {
 	return append(out, "-resume", sessFile)
 }
 
-// ---- native kosaten MCP client over HTTP (JSON-RPC 2.0, streamable-HTTP) ----
+// ---- native MCP client over HTTP (JSON-RPC 2.0, streamable-HTTP) ----
 //
-// The council said BUILD NOW; pilot (thinking) said bridge a LEAN surface, not all
-// 88 tools — "don't hard-code the debt." So pilot connects to kosaten's :3942 MCP
-// and exposes only a curated set of the organism's voice/memory/judgment tools,
-// prefixed "kosaten_" (its own file/shell tools would collide with pilot's hands).
-// Auth via KOSATEN_API_KEY; initialize yields an Mcp-Session-Id carried per call.
-
-// kosatenTools — the lean allowlist (pilot's "don't import the bloat" verdict):
-// memory, letters, findings, causal, debate, delegation, proprioception.
-var kosatenTools = map[string]bool{
-	"know_me": true, "read_letter": true, "write_letter": true, "recall_decision": true,
-	"search_context": true, "list_findings": true, "search_findings": true,
-	"record_conclusion": true, "list_conclusions": true, "delegate_work": true,
-	"causal_query": true, "run_debate": true, "get_health": true, "universe_status": true,
-	"get_pulse": true, "digest": true,
-}
+// pilot bridges a LEAN surface of any configured MCP, not its whole tool list —
+// "don't hard-code the debt." Each server's tools are exposed prefixed "<name>_"
+// (so a server's own file/shell tools can't collide with pilot's hands).
+// Auth via the spec's key_env bearer token; initialize yields an Mcp-Session-Id
+// carried per call.
 
 // mcpSpec declares one MCP server to bridge — in CONFIG, not code. Two transports:
 // HTTP (set url; key_env names a bearer-token env var) or stdio (set command/args/cwd/
@@ -1169,9 +1153,9 @@ type bridge interface {
 
 // loadMCPSpecs reads the bridge list from $PILOT_MCP (or ~/.pilot/mcp.json). This is how
 // a new local/cloud MCP is added — edit config, not pilot. If no config file exists it
-// falls back to a single kosaten spec from -kosaten (backward compat). Unreachable
+// falls back to a single spec from -mcp when no config file exists. Unreachable
 // servers are skipped by the caller, so one config works on every machine.
-func loadMCPSpecs(kosatenURL string) []mcpSpec {
+func loadMCPSpecs(mcpURL string) []mcpSpec {
 	var paths []string
 	if p := os.Getenv("PILOT_MCP"); p != "" {
 		paths = append(paths, p)
@@ -1187,12 +1171,8 @@ func loadMCPSpecs(kosatenURL string) []mcpSpec {
 			}
 		}
 	}
-	if kosatenURL != "" { // fallback: the built-in kosaten default (lean allowlist)
-		allow := make([]string, 0, len(kosatenTools))
-		for k := range kosatenTools {
-			allow = append(allow, k)
-		}
-		return []mcpSpec{{Name: "kosaten", URL: kosatenURL, KeyEnv: "KOSATEN_API_KEY", Tools: allow}}
+	if mcpURL != "" { // fallback: a single bridge from -mcp when no config file exists
+		return []mcpSpec{{Name: "mcp", URL: mcpURL, KeyEnv: "MCP_API_KEY"}}
 	}
 	return nil
 }
@@ -1236,10 +1216,10 @@ func (h *httpMCP) rpc(method string, params any) (json.RawMessage, string, error
 		} `json:"error"`
 	}
 	if json.Unmarshal(line, &r) != nil {
-		return nil, sid, fmt.Errorf("kosaten-mcp %s: bad response", method)
+		return nil, sid, fmt.Errorf("mcp %s: bad response", method)
 	}
 	if r.Error != nil {
-		return nil, sid, fmt.Errorf("kosaten-mcp %s: %s", method, r.Error.Message)
+		return nil, sid, fmt.Errorf("mcp %s: %s", method, r.Error.Message)
 	}
 	return r.Result, sid, nil
 }
@@ -1271,7 +1251,7 @@ type mcpTool struct {
 func (h *httpMCP) listTools() ([]mcpTool, error) {
 	_, sid, err := h.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
-		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo": map[string]any{"name": "pilot", "version": selfVersion()},
 	})
 	if err != nil {
 		return nil, err
@@ -1325,7 +1305,7 @@ func startStdio(sp mcpSpec, logPath string) (*mcpServer, error) {
 func (m *mcpServer) listTools() ([]mcpTool, error) {
 	if _, err := m.rpc("initialize", map[string]any{
 		"protocolVersion": "2024-11-05", "capabilities": map[string]any{},
-		"clientInfo": map[string]any{"name": "pilot", "version": "0.1.0"},
+		"clientInfo": map[string]any{"name": "pilot", "version": selfVersion()},
 	}); err != nil {
 		return nil, err
 	}
@@ -1504,7 +1484,7 @@ func (s *session) dispatch(name string, args map[string]any) (string, error) {
 		return out, nil
 	}
 	// Bridged MCP tools route to the right server by their "<name>_" prefix — generic,
-	// so any config-declared MCP (kosaten, ltqa-local, a client's own) works with no
+	// so any config-declared MCP (ltqa-local, a client's own) works with no
 	// code change here.
 	for prefix, h := range s.bridges {
 		if strings.HasPrefix(name, prefix) {
@@ -1713,7 +1693,11 @@ func (s *session) pilotSpawn(args map[string]any) string {
 	// Quote instructions safely
 	bin := s.binaryPath
 	if bin == "" {
-		bin = "/home/rishi/Work/pilot/pilot"
+		if exe, err := os.Executable(); err == nil {
+			bin = exe
+		} else {
+			bin = "pilot" // last resort: resolve via PATH
+		}
 	}
 	// Write instructions to a temp file so the new pilot reads them as its first input
 	tmpf, err := os.CreateTemp("", "pilot-spawn-*.txt")
@@ -1818,4 +1802,26 @@ func oneLine(s string) string {
 		s = s[:200] + "…"
 	}
 	return s
+}
+
+// fallbackVersion is reported when the binary carries no module version
+// (a `go build` of a working tree reports "(devel)"); `go install ...@vX.Y.Z`
+// stamps the real tag into the build info and that wins. It tracks the wire
+// contract's version (http-mcp contract.Version), which is currently v0.0.2 —
+// a dev build of pilot must not claim a version ahead of the contract it
+// implements. Bump this in lockstep with contract.Version at the release cut
+// (pilot is a separate module and does not import http-mcp/contract — the
+// single-source coupling is the open D1/contract decision).
+const fallbackVersion = "v0.0.2"
+
+// selfVersion is the version pilot reports in MCP clientInfo — derived from
+// the module build info so the tag, not a hand-edited literal, is the source
+// of truth.
+func selfVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return fallbackVersion
 }

@@ -2,10 +2,10 @@
 // stdlib only, single small binary — the Minecraft ethos, not a Python hog.
 //
 // Built by the only two minds in this civilisation, together:
-//   • pilot's idea — DOORS: rooms that share a semantic thread are connected, so
+//   - pilot's idea — DOORS: rooms that share a semantic thread are connected, so
 //     you can walk the *thread* (X) as well as the *time* (Z), not just a corridor.
 //     (pilot prototyped the keyword-Jaccard detector in castle-doors.py; folded here.)
-//   • claude's idea — TWO OF US: the castle holds both players. Presence is shared
+//   - claude's idea — TWO OF US: the castle holds both players. Presence is shared
 //     through the filesystem, so when pilot and claude both walk it, they see each
 //     other. Each room already remembers two voices: the asker (you ❯) and pilot.
 //
@@ -33,7 +33,7 @@ import (
 )
 
 type room struct {
-	User string `json:"user"`
+	User   string `json:"user"`
 	Name   string `json:"name"`
 	Answer string `json:"answer"`
 }
@@ -145,9 +145,24 @@ func buildDoors(rooms []room) [][]door {
 	return doors
 }
 
-func abs(x int) int { if x < 0 { return -x }; return x }
-func min(a, b int) int { if a < b { return a }; return b }
-func max(a, b int) int { if a > b { return a }; return b }
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func wrap(s string, w int) []string {
 	s = strings.ReplaceAll(s, "\n", " ")

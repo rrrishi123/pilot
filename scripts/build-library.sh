@@ -1,6 +1,6 @@
 #!/bin/bash
 # Underground Library/Cavern at x=110-120, y=-20
-# Run: bash /home/rishi/Work/pilot/scripts/build-library.sh
+# Run: bash scripts/build-library.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 

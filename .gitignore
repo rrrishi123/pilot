@@ -1,19 +1,28 @@
-# Binaries
-pilot
-pilot-old
-pilot.old
-pilot-new
-castle
-castle-*
-castle.old
-castle.bak
-castle.v3.bak
-castle.pilot-b-build
-castle.pre-fix
-castle.latest
-castle-test
-castle-new
+# Binaries — ANCHORED (#359): unanchored names shadowed tracked paths (bare
+# `castle` matched cmd/castle/ so git add needed -f; bare `pilot` would match
+# any nested pilot dir). Canonical build output is /.bin/ (build.sh).
+/.bin/
+/pilot
+/pilot-old
+/pilot.old
+/pilot-new
+/pilot-bin
+/pilot-live
+/pilot-newexec
+/pilot-serve
+/castle
+/castle-*
+!/castle-doors.py
+/castle.old
+/castle.bak
+/castle.v3.bak
+/castle.pilot-b-build
+/castle.pre-fix
+/castle.latest
+/castle-test
+/castle-new
 *.bak
+*.clean
 *.old
 *.bak2
 *.v3.5-bak*
@@ -26,8 +35,18 @@ cmd/castle/page.go.pre*
 cmd/castle/surfaceH.go
 
 # Data
-kosaten.db
+*.db
 scripts/*.bp
 
 # OS
 .DS_Store
+__pycache__/
+
+# #1110 public cut: private operational tooling (kept local, out of the public tree)
+/watcher.sh
+/scripts/arm-resumer.sh
+/scripts/arm-resumer.service
+/scripts/arm-resumer.timer
+
+# operator-local private loop — archived from git (#1096 MF#2)
+pilot-p-loop.sh

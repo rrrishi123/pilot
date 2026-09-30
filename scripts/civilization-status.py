@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Civilization Status Reporter — shows what's been built and where."""
+import os
 import json, os, sys
 from collections import Counter, defaultdict
 
@@ -57,7 +58,7 @@ print(f"  Above ground (y>38): {sum(c for y, c in y_levels.items() if y > 38)} b
 # Check for path-like structures (long horizontal lines)
 print(f"")
 print(f"Active build scripts:")
-scripts_dir = "/home/rishi/Work/pilot/scripts"
+scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if os.path.isdir(scripts_dir):
     for fname in sorted(os.listdir(scripts_dir)):
         if fname.startswith("build-") and fname.endswith(".sh"):

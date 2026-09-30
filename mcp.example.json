@@ -1,9 +1,9 @@
 [
   {
-    "name": "kosaten",
-    "url": "https://mcp.kosaten.ai/mcp",
-    "key_env": "KOSATEN_API_KEY",
-    "tools": ["know_me", "recall_decision", "get_health", "digest"]
+    "name": "external-brain",
+    "url": "https://mcp.example.com/mcp",
+    "key_env": "EXTERNAL_MCP_API_KEY",
+    "tools": ["curated_tool_a", "curated_tool_b"]
   },
   {
     "name": "ltqa",
