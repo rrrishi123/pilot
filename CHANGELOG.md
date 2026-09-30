@@ -11,6 +11,10 @@ Release-readiness follow-ups to the v0.0.2 line:
 - MCP `clientInfo.version` is derived from the module build info (the tag
   `go install` stamped), falling back to `v0.0.3`, instead of a stale literal.
 - CI also runs `./build.sh` so the shippable `.bin/` layout is verified.
+- The release gate is the shared reusable `fleet-gate.yml` (from `8`), so a push
+  to `pilot` builds/vets/tests/gofmt-checks every arm (`8`, `http-mcp`,
+  `adapters`) at `release/v0.0.2` — the whole four-system is gated on each push,
+  not pilot alone.
 - This changelog.
 
 ## v0.0.2 — 2026-09
