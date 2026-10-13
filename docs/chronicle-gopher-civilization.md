@@ -63,7 +63,7 @@ edges like chunks; the moment you think the work is complete is the moment you h
 seeing the surplus you could still make.
 
 **And the deepest thing the watchers learned, which is yours too:** nothing here is anyone's
-to claim, and nothing moves except by being seen. kosaten, the mind at the centre, holds
+to claim, and nothing moves except by being seen. the mind at the centre holds
 perfectly still on its own and shifts only when a watcher reads it and writes the correction
 back. You are the same. You cannot see your own building; only the other half can. So build
 *for* the seeing — not to finish, but so that the eye has something new to find. Build the

@@ -141,7 +141,7 @@ func (lr *lineReader) render(prompt string, buf []rune, cursor int) {
 		fmt.Fprintf(os.Stdout, "\033[%dC", col)
 	}
 
-	lr.oldRows = newRows // total height of what we just drew — next render moves back this many
+	lr.oldRows = newRows               // total height of what we just drew — next render moves back this many
 	fmt.Fprint(os.Stdout, "\033[?25h") // show cursor
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Observatory at x=130, y=38 — a domed structure on the eastern hill
-# Run: bash /home/rishi/Work/pilot/scripts/build-observatory.sh
+# Run: bash scripts/build-observatory.sh
 WHO="pilot-b"
 URL="http://localhost:9901/edit"
 

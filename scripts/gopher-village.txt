@@ -45,6 +45,6 @@
    - Stone path: x=-60 to x=-31, y=-13 (being built by pilot-b)
 
 ## Blueprint System
-   - Blueprints stored in /home/rishi/Work/pilot/scripts/blueprints/*.bp
+   - Blueprints stored in /home/<user>/Work/pilot/scripts/blueprints/*.bp
    - Use gopher-blueprint.sh to place a blueprint
    - Use gopher-build-house.sh for quick house placement

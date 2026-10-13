@@ -1,6 +1,6 @@
 #!/bin/bash
 # Gopher Workshop — a forge at x=110, y=38 where gophers build things
-# Run: bash /home/rishi/Work/pilot/scripts/build-workshop.sh
+# Run: bash scripts/build-workshop.sh
 WHO="pilot-a"
 URL="http://localhost:9901/edit"
 
