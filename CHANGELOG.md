@@ -4,7 +4,7 @@ All four arms of the four-system (8, http-mcp, pilot, adapters) version
 independently; the wire contract carries its own version (`contract.Version`
 in http-mcp). Tags are unsigned.
 
-## v0.0.3 (unreleased, branch `release/v0.0.2`)
+## v0.0.3 — 2026-10-21
 
 Release-readiness follow-ups to the v0.0.2 line:
 
@@ -24,6 +24,7 @@ Release-readiness follow-ups to the v0.0.2 line:
   hardcoded home paths.
 - SECURITY.md and CONTRIBUTING.md.
 - This changelog.
+- `fallbackVersion` is `v0.0.3`, matching `contract.Version`.
 
 ## v0.0.2 — 2026-09
 
