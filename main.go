@@ -382,10 +382,9 @@ func (s *session) broodLoop() {
 func repl(s *session, names []string, bin string) {
 	s.interactive = isTTY(os.Stdin)
 	// -p (one-shot print mode): the whole of stdin is ONE prompt, one turn, exit.
-	// This is the claude -p convention. Three independent callers (pilot-p-loop.sh,
-	// a delegate idiom (internal/mcp/delegate.go, the .anthro scripts' idiom)
-	// all reached for `pilot -p` before it existed — each filled the interface gap
-	// with the same coherent model (the anthropologist's inversion law, 2026-07-12).
+	// This is the claude -p convention: a loop script, a delegate
+	// (internal/mcp/delegate.go) and other scripted callers all reached for
+	// `pilot -p` before it existed, and each filled the gap the same way.
 	// Rather than repair every caller to the quirky line-per-turn pipe contract,
 	// this makes their shared model true.
 	if s.oneShot {

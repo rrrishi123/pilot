@@ -15,6 +15,14 @@ Release-readiness follow-ups to the v0.0.2 line:
   to `pilot` builds/vets/tests/gofmt-checks every arm (`8`, `http-mcp`,
   `adapters`) at `release/v0.0.2` — the whole four-system is gated on each push,
   not pilot alone.
+- **Breaking: `-kosaten` is now `-mcp`.** It is empty by default, takes the MCP
+  server URL, and reads its key from `MCP_API_KEY` (was `KOSATEN_API_KEY`).
+  There is no built-in default server any more. The fallback spec bridges the
+  server's whole tool list; the old 16-tool allowlist was specific to one server.
+- Home-specific scripts removed from the public tree (`watcher.sh`,
+  `arm-resumer.*`, `pilot-p-loop.sh`), along with four committed binaries and
+  hardcoded home paths.
+- SECURITY.md and CONTRIBUTING.md.
 - This changelog.
 
 ## v0.0.2 — 2026-09
