@@ -1,7 +1,7 @@
 name: ci
 
 # The same gate http-mcp has carried since July, now on every arm of the
-# four-system (v0.0.2 audit: CI to all arms): build, vet, test, gofmt.
+# four-system (CI to all arms): build, vet, test, gofmt.
 on:
   push:
   pull_request:
