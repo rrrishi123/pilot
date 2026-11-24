@@ -1,11 +1,34 @@
 # pilot — the HOST
 
-> Part of **The Wire** — a **witnessed substrate for agents**: two modes over a lean wire that any mind acts on, and a witness that makes agents continuous, auditable, and federated across hosts. (Record-and-replay test automation is one application, not the definition.)
-> **This repo is the pilot — the HOST** — the local-model OODA Orient+Decide loop; imports an adapter to run flows.
+**A local model with hands: it talks, decides, and then makes the call against the world for real.** Say "hi" — there's no objective up front; the work grows out of the dialogue. When what you ask needs a real action, the model reaches for a tool and pilot executes it: a **CALL** (`http_request`) or a **CHANNEL** command go out through the wire, and the conversation continues with the actual response in hand. pilot is the OODA **Orient + Decide** between brain and hands.
+
+## Quick start
+
+```bash
+git clone https://github.com/rrrishi123/pilot && cd pilot
+./build.sh                       # builds .bin/{pilot,broker,castle} (first build fetches Go modules)
+echo "hi" | .bin/pilot --provider ollama   # fully local, no key; drop --provider for the deepseek default (needs API_KEY)
+```
+
+The brain is a model provider (`--provider deepseek` by default, or `--provider ollama` for a fully local one). The hands are the wire, spawned as a tool-server (`http_request` + `discover`), plus pilot's own built-ins (`run_command`, `read_file`, `write_file`, `list_dir`).
+
+## What you get
+
+- **Conversation, not a script** — talk to it like anyone; it chats plainly until a real call is actually needed, then acts.
+- **The wire for free** — pilot spawns http-mcp as a tool-server, so the same two atoms that drive any WebDriver/Appium hub are available to the model without pilot re-implementing a byte of transport.
+- **Hands that live in the host** — `run_command`, `read_file`, `write_file`, `list_dir` are pilot's own, kept *out* of the wire so http-mcp stays a pure HTTP server.
+- **Safe by default** — mutating tools (`run_command`, `write_file`) ask for confirmation in an interactive session.
+- **Imports an adapter to run flows** — provider shape and composition come from the arms above; pilot owns agency, never transport.
+
+<details><summary><b>The deeper idea — the Orient+Decide loop</b></summary>
+
+> Part of **The Wire** — a witnessed substrate for agents: **two modes** (CALL and CHANNEL) over a lean wire any mind acts on, with a witness that makes agents continuous, auditable, and federated. This repo is the **HOST** — the OODA Orient+Decide loop that carries the dialogue, merges the tool set, executes calls, and loops. It owns agency; it never owns the wire's transport or a provider's shape.
 > **The four arms:** [http-mcp](https://github.com/rrrishi123/http-mcp) (WIRE) · [8](https://github.com/rrrishi123/8) (WITNESS) · [pilot](https://github.com/rrrishi123/pilot) (HOST) · [adapters](https://github.com/rrrishi123/adapters) (ARMS)
+> **Going deeper:** [TRANSPORTS.md](TRANSPORTS.md) (the two modes the host drives) · [docs/orchestration-and-webhooks.md](docs/orchestration-and-webhooks.md).
+
+</details>
 
 ---
-
 <!-- ===== SHARED TERRITORY (identical across http-mcp · 8 · pilot · adapters) ===== -->
 
 # The Wire — a witnessed substrate for agents
@@ -144,7 +167,6 @@ The model learns **only from what comes back** (afferent); nothing flows *toward
 **Act lives inside Observe** — an act is known only by observing its result. `efferent` (toward the target)
 is one leg; the model's knowledge is built from the `afferent` leg alone.
 
-
 ## Inscription is truth (what may be trusted)
 
 Only the **witnessed record** may be trusted — the ledger, `/manifest`, `/resolve`, the
@@ -166,6 +188,7 @@ findings into law across resurrections. The rule that makes this knowledge and n
 digest keeps a pointer back to the undigested record, so any claim it carries can be re-checked
 against the witness. A mind is its mantra plus its sediment, resurrected by a digest whose
 residue stays auditable.
+
 ## 8 — the witness: observe every tab, control none
 
 8 is the OODA **Observe**. It must see *all* tabs (per-tab memory/CPU/events, including itself)
@@ -273,7 +296,7 @@ flowchart TB
 
 Independent semver **per arm** + a separately-versioned **contract** (trace format, RunRequest/RunResult).
 Each arm declares which contract version it supports; the replay runner checks a trace's contract version
-before replaying. Baseline: **`v0.0.1`** across all four arms.
+before replaying. Baseline: **`v0.0.2`** across all four arms.
 
 ## Why "the wire is enough"
 
@@ -301,3 +324,24 @@ Orients/Decides, witness Observes; **Kalman observability** — you cannot contr
 The full transport candidate list — **HTTP, WebSocket, SSE, MJPEG, Unix socket, gRPC, MQTT, WebRTC** — all reduce to the wire's **two atoms**: `http_request` (CALL) and `bidi_command` (CHANNEL). Raw bytes ⇒ wire; framing/routing/negotiation ⇒ adapter.
 
 → See **[TRANSPORTS.md](./TRANSPORTS.md)** for the full map (prose + Mermaid). Machine-readable: the http-mcp MCP **`transports`** tool returns [`transports.json`](https://github.com/rrrishi123/http-mcp/blob/main/contract/transports/transports.json) verbatim — the map any agent reads first.
+
+## Local stack — drivers & seats
+
+The four-arm system runs a **generic local stack** (no cloud). Two drivers bridge
+real targets to the wire, and every target becomes a **seat** on 8:
+
+| driver | bridges | seat(s) on 8 |
+|---|---|---|
+| **geckodriver** (`scripts/up.sh`) | Firefox | `fox` (CHANNEL, BiDi) + a request seat (CALL, classic WebDriver) — same browser, two physics |
+| **Appium** (`scripts/devices.sh`) | real iOS / Android | one CALL seat per connected device |
+
+`scripts/devices.sh` starts a local Appium server, enumerates connected devices
+(`adb` + libimobiledevice), creates one session per device **through the wire**
+(`http_request` POST `<hub>/session` — the CALL atom), and registers each as a
+seat. 8 then sees + drives every seat on the same call-path — `/shot` (screenshot),
+`/source` (UI tree), `/act` (W3C tap/swipe/type). The cockpit canvas lays a live
+viewport per seat; bird's-eye shows Firefox + every device at once.
+
+iOS needs WebDriverAgent signed with a provisioning profile on the device; if a
+session create fails on signing, that is the only blocker. Cloud (LambdaTest etc.)
+is a separate, vast concern handled in `adapters`, not the lean local stack.
